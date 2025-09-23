@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 import tomli
-from cached_path import cached_path
+# from cached_path import cached_path
 from hydra.utils import get_class
 from omegaconf import OmegaConf
 from unidecode import unidecode
@@ -19,6 +19,7 @@ from f5_tts.infer.utils_infer import (
     cross_fade_duration,
     device,
     fix_duration,
+    infer_batch,
     infer_process,
     load_model,
     load_vocoder,
@@ -287,8 +288,8 @@ elif model == "E2TTS_Base":
     repo_name = "E2-TTS"
     ckpt_step = 1200000
 
-if not ckpt_file:
-    ckpt_file = str(cached_path(f"hf://SWivid/{repo_name}/{model}/model_{ckpt_step}.{ckpt_type}"))
+# if not ckpt_file:
+    # ckpt_file = str(cached_path(f"hf://SWivid/{repo_name}/{model}/model_{ckpt_step}.{ckpt_type}"))
 
 print(f"Using {model}...")
 ema_model = load_model(
@@ -336,7 +337,14 @@ def main():
         local_speed = voices[voice].get("speed", speed)
         gen_text_ = text.strip()
         print(f"Voice: {voice}")
-        audio_segment, final_sample_rate, spectrogram = infer_process(
+        
+        # for testing infer_batch
+        # ref_audio_ = [ref_audio_, ref_audio_]
+        # ref_text_ = [ref_text_, ref_text_]
+        # gen_text_ = [gen_text_, "I'm currently focusing."]
+
+        # audio_segment, final_sample_rate, spectrogram = infer_process(
+        audio_segment, final_sample_rate = infer_batch(
             ref_audio_,
             ref_text_,
             gen_text_,
@@ -352,6 +360,13 @@ def main():
             fix_duration=fix_duration,
             device=device,
         )
+        if isinstance(audio_segment, list): # is infer_batch, not infer_process
+            for idx, ag in enumerate(audio_segment):
+                sf.write(f"temp/tmp_{idx}.wav", ag, 24000)
+
+            # normally, it is single inference
+            audio_segment = audio_segment[0]
+        
         generated_audio_segments.append(audio_segment)
 
         if save_chunk:

@@ -339,9 +339,9 @@ def main():
         print(f"Voice: {voice}")
         
         # for testing infer_batch
-        # ref_audio_ = [ref_audio_, ref_audio_]
-        # ref_text_ = [ref_text_, ref_text_]
-        # gen_text_ = [gen_text_, "I'm currently focusing."]
+        ref_audio_ = [ref_audio_, ref_audio_]
+        ref_text_ = [ref_text_, ref_text_]
+        gen_text_ = [gen_text_, "I'm currently focusing."]
 
         # audio_segment, final_sample_rate, spectrogram = infer_process(
         audio_segment, final_sample_rate = infer_batch(

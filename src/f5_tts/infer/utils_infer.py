@@ -38,11 +38,7 @@ _ref_text_cache = {}
 device = (
     "cuda"
     if torch.cuda.is_available()
-    else "xpu"
-    if torch.xpu.is_available()
-    else "mps"
-    if torch.backends.mps.is_available()
-    else "cpu"
+    else "xpu" if torch.xpu.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 )
 
 tempfile_kwargs = {"delete_on_close": False} if sys.version_info >= (3, 12) else {"delete": False}
@@ -119,8 +115,7 @@ def load_vocoder(vocoder_name="vocos", is_local=False, local_path="", device=dev
 
         if isinstance(vocoder.feature_extractor, EncodecFeatures):
             encodec_parameters = {
-                "feature_extractor.encodec." + key: value
-                for key, value in vocoder.feature_extractor.encodec.state_dict().items()
+                "feature_extractor.encodec." + key: value for key, value in vocoder.feature_extractor.encodec.state_dict().items()
             }
             state_dict.update(encodec_parameters)
         vocoder.load_state_dict(state_dict)
@@ -208,9 +203,7 @@ def load_checkpoint(model, ckpt_path, device: str, dtype=None, use_ema=True):
         if ckpt_type == "safetensors":
             checkpoint = {"ema_model_state_dict": checkpoint}
         checkpoint["model_state_dict"] = {
-            k.replace("ema_model.", ""): v
-            for k, v in checkpoint["ema_model_state_dict"].items()
-            if k not in ["initted", "step"]
+            k.replace("ema_model.", ""): v for k, v in checkpoint["ema_model_state_dict"].items() if k not in ["initted", "step"]
         }
 
         # patch for backward compatibility, 305e3ea
@@ -584,9 +577,7 @@ def infer_batch_process(
 
 def remove_silence_for_generated_wav(filename):
     aseg = AudioSegment.from_file(filename)
-    non_silent_segs = silence.split_on_silence(
-        aseg, min_silence_len=1000, silence_thresh=-50, keep_silence=500, seek_step=10
-    )
+    non_silent_segs = silence.split_on_silence(aseg, min_silence_len=1000, silence_thresh=-50, keep_silence=500, seek_step=10)
     non_silent_wave = AudioSegment.silent(duration=0)
     for non_silent_seg in non_silent_segs:
         non_silent_wave += non_silent_seg
@@ -617,13 +608,13 @@ def pad_1d(tensors: list[torch.Tensor], pad_value):
 def pad_2d(tensors: list[torch.Tensor], pad_value):
     lens = [int(t.size(0)) for t in tensors]
     assert min(lens) == max(lens)
-    
+
     lens = [int(t.size(1)) for t in tensors]
     max_len = max(lens)
-    
+
     first = tensors[0]
     padded = torch.full((len(tensors), first.size(0), max_len), pad_value, device=first.device, dtype=first.dtype)
-    
+
     for index, tensor in enumerate(tensors):
         padded[index, :, : tensor.size(1)] = tensor
     return padded, lens
@@ -642,7 +633,7 @@ def infer_batch(
     cfg_strength=cfg_strength,
     sway_sampling_coef=sway_sampling_coef,
     device=device,
-    mel_trunc: int = 1,
+    mel_trunc: int = 2,
     fix_duration=None,
     mel_spec_type=None,
 ):
@@ -654,7 +645,7 @@ def infer_batch(
         gen_texts = [gen_texts]
     if isinstance(speed, float):
         speed = [speed for _ in range(len(ref_audios))]
-        
+
     assert len(ref_audios) == len(ref_texts)
     assert len(ref_audios) == len(gen_texts)
     assert len(ref_audios) == len(speed)
@@ -664,57 +655,55 @@ def infer_batch(
     durations = []
     rms_list = []
     ref_audio_len_list = []
-    
+
     sample_lens = []
-    
+
     for ref_audio, ref_text, gen_text, local_speed in zip(ref_audios, ref_texts, gen_texts, speed):
-        ref_text = " " + ref_text
-        
         audio, sr = torchaudio.load(ref_audio)
         if audio.shape[0] > 1:
             audio = torch.mean(audio, dim=0, keepdim=True)
-            
+
         rms = torch.sqrt(torch.mean(torch.square(audio))).item()
         if rms < target_rms:
             audio = audio * target_rms / rms
         if sr != target_sample_rate:
             resampler = torchaudio.transforms.Resample(sr, target_sample_rate)
             audio = resampler(audio)
-            
+
         max_chars = int(len(ref_text.encode("utf-8")) / (audio.shape[-1] / sr) * (22 - audio.shape[-1] / sr) * local_speed)
         gen_chunks = chunk_text(gen_text, max_chars=max_chars)
         sample_lens.append(len(gen_chunks))
 
         for gen_chunk in gen_chunks:
-            gen_chunk = " " + gen_chunk
-            
+            gen_chunk = " " + gen_chunk + " "
+
             # TODO. currently, use the same speed for all samples
             if len(gen_text.encode("utf-8")) < 10:
                 local_speed = 0.3
-            
-            audio_list.append(audio) # audio shape is [1, N]
+
+            audio_list.append(audio)  # audio shape is [1, N]
             rms_list.append(rms)
-            
+
             ref_audio_len = audio.shape[-1] // hop_length
             ref_audio_len_list.append(ref_audio_len)
-            
+
             text_list.append(convert_char_to_pinyin([gen_chunk + ref_text])[0])
 
             ref_text_len = len(ref_text.encode("utf-8"))
             gen_chunk_len = len(gen_chunk.encode("utf-8"))
-            
+
             duration = ref_audio_len + int(ref_audio_len / ref_text_len * gen_chunk_len / local_speed)
             durations.append(duration)
 
     duration = torch.LongTensor(durations).to(device)
-    
+
     # inference
     with torch.inference_mode():
         cond = [model_obj.mel_spec(audio)[0] for audio in audio_list]
         cond, cond_lens = pad_2d(cond, pad_value=0.0)
         cond = cond.to(device).permute(0, 2, 1)
         cond_lens = torch.LongTensor(cond_lens).to(device)
-        
+
         generated, trajectory = model_obj.sample_left(
             cond=cond,
             text=text_list,
@@ -733,18 +722,19 @@ def infer_batch(
         if False:
             # For debugging
             import soundfile as sf
+
             for index in range(generated.size(0)):
                 dur = durations[index]
                 ref_audio_len = ref_audio_len_list[index]
                 print(dur, ref_audio_len)
-                wav = vocoder.decode(generated[index: index + 1, :, : dur - ref_audio_len]).squeeze().cpu().numpy()
+                wav = vocoder.decode(generated[index : index + 1, :, : dur - ref_audio_len]).squeeze().cpu().numpy()
                 # wav = vocoder.decode(generated[index: index + 1, :, :]).squeeze().cpu().numpy()
                 print(wav.shape)
                 sf.write(f"temp/{index}.wav", wav, 24000)
             exit()
-        
+
         if False:
-            generated_waves = vocoder.decode(generated).cpu().numpy() # [B, N]
+            generated_waves = vocoder.decode(generated).cpu().numpy()  # [B, N]
 
             generated_audio_list = []
             for generated_wave, rms, dur, ref_audio_len in zip(generated_waves, rms_list, durations, ref_audio_len_list):
@@ -752,15 +742,15 @@ def infer_batch(
                 if rms < target_rms:
                     generated_wave = generated_wave * rms / target_rms
                 generated_audio_list.append(generated_wave)
-            
+
         else:
             tmp_generated = [
-                generated[index, :, : durations[index] - ref_audio_len_list[index] - mel_trunc] 
-                    for index in range(generated.size(0))
+                generated[index, :, : durations[index] - ref_audio_len_list[index] - mel_trunc]
+                for index in range(generated.size(0))
             ]
             tmp_generated, _ = pad_2d(tmp_generated, pad_value=0.0)
-            generated_waves = vocoder.decode(tmp_generated).cpu().numpy() # [B, N]
-            
+            generated_waves = vocoder.decode(tmp_generated).cpu().numpy()  # [B, N]
+
             generated_audio_list = []
             for generated_wave, rms, dur, ref_audio_len in zip(generated_waves, rms_list, durations, ref_audio_len_list):
                 generated_wave = generated_wave[: (dur - ref_audio_len - mel_trunc) * hop_length]
@@ -773,7 +763,7 @@ def infer_batch(
     for size in sample_lens:
         audio_chunks = generated_audio_list[start : start + size]
         start += size
-        
+
         if cross_fade_duration <= 0:
             final_audio = np.concatenate(audio_chunks)
         else:
@@ -781,7 +771,7 @@ def infer_batch(
             for i in range(1, len(audio_chunks)):
                 prev_chunk = final_audio
                 next_chunk = audio_chunks[i]
-                
+
                 cross_fade_samples = int(cross_fade_duration * target_sample_rate)
                 cross_fade_samples = min(cross_fade_samples, len(prev_chunk), len(next_chunk))
 
@@ -805,7 +795,7 @@ def infer_batch(
                 final_audio = np.concatenate(
                     [prev_chunk[:-cross_fade_samples], cross_faded_overlap, next_chunk[cross_fade_samples:]]
                 )
-                
+
         final_audio_list.append(final_audio)
 
     return final_audio_list, target_sample_rate

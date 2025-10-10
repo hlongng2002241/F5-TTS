@@ -620,6 +620,156 @@ def pad_2d(tensors: list[torch.Tensor], pad_value):
     return padded, lens
 
 
+def detect_bigvgan_mel_artifact_frames(mel_spec, n_frames=2, threshold_drop=-0.5):
+    """
+    Detect artifact frames at the end of mel spectrogram based on energy gradient analysis.
+
+    For BigVGAN mel spectrograms (log-domain: torch.log(torch.clamp(mel, min=1e-5))).
+
+    Key concept:
+    - Natural speech endings have smooth energy decay (gradual gradient)
+    - Artifact frames show sudden energy drops (steep negative gradient)
+
+    Args:
+        mel_spec: Mel spectrogram tensor/array of shape [mel_channels, time_frames]
+                  Values are in log-domain (from BigVGAN mel extraction)
+        n_frames: Number of last frames to evaluate (default: 2)
+        threshold_drop: Gradient threshold for sudden drop detection (default: -0.5)
+                        -0.5 = 50% energy drop indicates artifact
+                        More negative = more sensitive (e.g., -0.3 detects 30% drops)
+
+    Returns:
+        int: Number of frames to truncate (0 to n_frames)
+    """
+    if n_frames == 0:
+        return 0
+
+    # Handle both torch tensors and numpy arrays
+    if isinstance(mel_spec, torch.Tensor):
+        mel_spec_np = mel_spec.cpu().numpy()
+    else:
+        mel_spec_np = mel_spec
+
+    if mel_spec_np.shape[-1] < n_frames + 1:
+        # Not enough frames to compute gradients, return default
+        return 1
+
+    # Convert from log-domain to linear-domain for energy calculation
+    # BigVGAN mel: torch.log(torch.clamp(mel, min=1e-5))
+    # Reverse: exp(log_mel) = linear_mel
+    mel_linear = np.exp(mel_spec_np)
+
+    # Calculate energy from linear-domain mel spectrogram
+    frame_energy = np.mean(mel_linear, axis=0)  # [time_frames]
+
+    # Compute energy gradients (percentage change between consecutive frames)
+    # gradient[i] = (energy[i+1] - energy[i]) / energy[i]
+    energy_gradients = []
+    for i in range(len(frame_energy) - 1):
+        if frame_energy[i] > 1e-8:  # Avoid division by zero
+            gradient = (frame_energy[i + 1] - frame_energy[i]) / frame_energy[i]
+        else:
+            gradient = 0.0
+        energy_gradients.append(gradient)
+
+    # Check last n_frames for sudden changes (spikes OR drops)
+    # Work backwards: if sudden change detected, truncate from there
+    truncate_count = 0
+    threshold_spike = abs(threshold_drop)  # Positive threshold for spikes
+
+    for i in range(n_frames - 1, -1, -1):  # Check from last frame backwards
+        # Gradient index: gradient between frame[i-1] and frame[i]
+        gradient_idx = -(n_frames - i) - 1  # -1, -2, ... for last frames
+
+        if gradient_idx >= -len(energy_gradients):
+            gradient = energy_gradients[gradient_idx]
+
+            # Detect sudden energy change (spike OR drop)
+            # Artifact can be: sudden drop (gradient < -0.5) OR sudden spike (gradient > +0.5)
+            if gradient < threshold_drop or gradient > threshold_spike:
+                truncate_count = n_frames - i
+            else:
+                # Found frame with normal gradient, stop truncating
+                break
+
+    return truncate_count
+
+
+def detect_vocos_mel_artifact_frames(mel_spec, n_frames=2, threshold_drop=-0.5):
+    """
+    Detect artifact frames at the end of mel spectrogram based on energy gradient analysis.
+
+    For Vocos mel spectrograms (log-domain: mel.clamp(min=1e-5).log()).
+
+    Key concept:
+    - Natural speech endings have smooth energy decay (gradual gradient)
+    - Artifact frames show sudden energy changes (steep negative/positive gradient)
+
+    Args:
+        mel_spec: Mel spectrogram tensor/array of shape [mel_channels, time_frames]
+                  Values are in log-domain (from Vocos mel extraction)
+        n_frames: Number of last frames to evaluate (default: 2)
+        threshold_drop: Gradient threshold for sudden change detection (default: -0.5)
+                        -0.5 = 50% energy drop/spike indicates artifact
+                        More negative = more sensitive (e.g., -0.3 detects 30% changes)
+
+    Returns:
+        int: Number of frames to truncate (0 to n_frames)
+    """
+    if n_frames == 0:
+        return 0
+
+    # Handle both torch tensors and numpy arrays
+    if isinstance(mel_spec, torch.Tensor):
+        mel_spec_np = mel_spec.cpu().numpy()
+    else:
+        mel_spec_np = mel_spec
+
+    if mel_spec_np.shape[-1] < n_frames + 1:
+        # Not enough frames to compute gradients, return default
+        return 1
+
+    # Convert from log-domain to linear-domain for energy calculation
+    # Vocos mel: mel.clamp(min=1e-5).log()
+    # Reverse: exp(log_mel) = linear_mel
+    mel_linear = np.exp(mel_spec_np)
+
+    # Calculate energy from linear-domain mel spectrogram
+    frame_energy = np.mean(mel_linear, axis=0)  # [time_frames]
+
+    # Compute energy gradients (percentage change between consecutive frames)
+    # gradient[i] = (energy[i+1] - energy[i]) / energy[i]
+    energy_gradients = []
+    for i in range(len(frame_energy) - 1):
+        if frame_energy[i] > 1e-8:  # Avoid division by zero
+            gradient = (frame_energy[i + 1] - frame_energy[i]) / frame_energy[i]
+        else:
+            gradient = 0.0
+        energy_gradients.append(gradient)
+
+    # Check last n_frames for sudden changes (spikes OR drops)
+    # Work backwards: if sudden change detected, truncate from there
+    truncate_count = 0
+    threshold_spike = abs(threshold_drop)  # Positive threshold for spikes
+
+    for i in range(n_frames - 1, -1, -1):  # Check from last frame backwards
+        # Gradient index: gradient between frame[i-1] and frame[i]
+        gradient_idx = -(n_frames - i) - 1  # -1, -2, ... for last frames
+
+        if gradient_idx >= -len(energy_gradients):
+            gradient = energy_gradients[gradient_idx]
+
+            # Detect sudden energy change (spike OR drop)
+            # Artifact can be: sudden drop (gradient < -0.5) OR sudden spike (gradient > +0.5)
+            if gradient < threshold_drop or gradient > threshold_spike:
+                truncate_count = n_frames - i
+            else:
+                # Found frame with normal gradient, stop truncating
+                break
+
+    return truncate_count
+
+
 def infer_batch(
     ref_audios: str | list[str],
     ref_texts: str | list[str],
@@ -629,14 +779,18 @@ def infer_batch(
     speed: float | list[float] = speed,
     target_rms=target_rms,
     cross_fade_duration=cross_fade_duration,
+    mel_spec_type="vocos",
     nfe_step=nfe_step,
     cfg_strength=cfg_strength,
     sway_sampling_coef=sway_sampling_coef,
     device=device,
-    mel_trunc: int = 2,
+    n_mel_frames_trunc: int = None,
     fix_duration=None,
-    mel_spec_type=None,
 ):
+    assert mel_spec_type in ["vocos", "bigvgan"]
+    if n_mel_frames_trunc is None:
+        n_mel_frames_trunc = 3 if mel_spec_type == "vocos" else 2
+
     if isinstance(ref_audios, str):
         ref_audios = [ref_audios]
     if isinstance(ref_texts, str):
@@ -744,16 +898,39 @@ def infer_batch(
                 generated_audio_list.append(generated_wave)
 
         else:
-            tmp_generated = [
-                generated[index, :, : durations[index] - ref_audio_len_list[index] - mel_trunc]
-                for index in range(generated.size(0))
-            ]
-            tmp_generated, _ = pad_2d(tmp_generated, pad_value=0.0)
-            generated_waves = vocoder.decode(tmp_generated).cpu().numpy()  # [B, N]
+            # Detect artifact frames for each generated mel spectrogram
+            refined_mels = []
+            mel_lengths = []
+            mel_frames_trunc_list = []
+
+            for index in range(generated.size(0)):
+                # Get the mel spectrogram for this sample (excluding reference audio part)
+                dur = durations[index]
+                ref_audio_len = ref_audio_len_list[index]
+                mel = generated[index, :, : dur - ref_audio_len]
+
+                if mel_spec_type == "vocos":
+                    n_trunc = detect_vocos_mel_artifact_frames(mel, n_frames=n_mel_frames_trunc, threshold_drop=-0.5)
+                else:
+                    n_trunc = detect_bigvgan_mel_artifact_frames(mel, n_frames=n_mel_frames_trunc, threshold_drop=-0.5)
+
+                mel_frames_trunc_list.append(n_trunc)
+                mel = mel[:, : mel.size(1) - n_trunc]
+                refined_mels.append(mel)
+                mel_lengths.append(mel.size(1))
+
+            print("mel_trunc_list =", mel_frames_trunc_list)
+            print("mel_lengths =", mel_lengths)
+
+            refined_mels, _ = pad_2d(refined_mels, pad_value=0.0)
+            if mel_spec_type == "vocos":
+                generated_waves = vocoder.decode(refined_mels).cpu().numpy()  # [B, N]
+            else:
+                generated_waves = vocoder(refined_mels).cpu().numpy()  # [B, N]
 
             generated_audio_list = []
-            for generated_wave, rms, dur, ref_audio_len in zip(generated_waves, rms_list, durations, ref_audio_len_list):
-                generated_wave = generated_wave[: (dur - ref_audio_len - mel_trunc) * hop_length]
+            for generated_wave, rms, mel_len in zip(generated_waves, rms_list, mel_lengths):
+                generated_wave = generated_wave[: mel_len * hop_length]
                 if rms < target_rms:
                     generated_wave = generated_wave * rms / target_rms
                 generated_audio_list.append(generated_wave)

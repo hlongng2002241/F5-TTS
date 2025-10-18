@@ -142,11 +142,12 @@ class CFM(nn.Module):
             test_cond = F.pad(cond, (0, 0, cond_seq_len, max_duration - 2 * cond_seq_len), value=0.0)
 
         cond = F.pad(cond, (0, 0, 0, max_duration - cond_seq_len), value=0.0)
-        if no_ref_audio:
-            cond = torch.zeros_like(cond)
-
         cond_mask = F.pad(cond_mask, (0, max_duration - cond_mask.shape[-1]), value=False)
         cond_mask = cond_mask.unsqueeze(-1)
+
+        if no_ref_audio:
+            cond = torch.zeros_like(cond)
+        
         step_cond = torch.where(
             cond_mask, cond, torch.zeros_like(cond)
         )  # allow direct control (cut cond audio) with lens passed in
@@ -174,20 +175,26 @@ class CFM(nn.Module):
                     drop_text=False,
                     cache=True,
                 )
-                return pred
+            else:
+                # predict flow (cond and uncond), for classifier-free guidance
+                pred_cfg = self.transformer(
+                    x=x,
+                    cond=step_cond,
+                    text=text,
+                    time=t,
+                    mask=mask,
+                    cfg_infer=True,
+                    cache=True,
+                )
+                pred, null_pred = torch.chunk(pred_cfg, 2, dim=0)
+                pred = pred + (pred - null_pred) * cfg_strength
 
-            # predict flow (cond and uncond), for classifier-free guidance
-            pred_cfg = self.transformer(
-                x=x,
-                cond=step_cond,
-                text=text,
-                time=t,
-                mask=mask,
-                cfg_infer=True,
-                cache=True,
-            )
-            pred, null_pred = torch.chunk(pred_cfg, 2, dim=0)
-            return pred + (pred - null_pred) * cfg_strength
+            # Mask predictions for padded frames to prevent ODE from evolving them
+            # This prevents artifacts in shorter sequences during batch inference
+            if batch > 1 and mask is not None:
+                pred = pred * mask.unsqueeze(-1)
+
+            return pred
 
         # noise input
         # to make sure batch inference result is same with different batch size, and for sure single inference
@@ -329,20 +336,26 @@ class CFM(nn.Module):
                     drop_text=False,
                     cache=True,
                 )
-                return pred
+            else:
+                # predict flow (cond and uncond), for classifier-free guidance
+                pred_cfg = self.transformer(
+                    x=x,
+                    cond=step_cond,
+                    text=text,
+                    time=t,
+                    mask=mask,
+                    cfg_infer=True,
+                    cache=True,
+                )
+                pred, null_pred = torch.chunk(pred_cfg, 2, dim=0)
+                pred = pred + (pred - null_pred) * cfg_strength
 
-            # predict flow (cond and uncond), for classifier-free guidance
-            pred_cfg = self.transformer(
-                x=x,
-                cond=step_cond,
-                text=text,
-                time=t,
-                mask=mask,
-                cfg_infer=True,
-                cache=True,
-            )
-            pred, null_pred = torch.chunk(pred_cfg, 2, dim=0)
-            return pred + (pred - null_pred) * cfg_strength
+            # Mask predictions for padded frames to prevent ODE from evolving them
+            # This prevents artifacts in shorter sequences during batch inference
+            if batch > 1 and mask is not None:
+                pred = pred * mask.unsqueeze(-1)
+
+            return pred
 
         # noise input
         # to make sure batch inference result is same with different batch size, and for sure single inference

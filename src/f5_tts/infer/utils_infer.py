@@ -29,7 +29,7 @@ from transformers import pipeline
 from vocos import Vocos
 
 from f5_tts.model import CFM
-from f5_tts.model.utils import convert_char_to_pinyin, get_tokenizer
+from f5_tts.model.utils import convert_char_to_pinyin, get_tokenizer, list_str_to_idx
 
 
 _ref_audio_cache = {}
@@ -770,7 +770,7 @@ def detect_vocos_mel_artifact_frames(mel_spec, n_frames=2, threshold_drop=-0.5):
     return truncate_count
 
 
-def infer_batch(
+def infer_batch_synthesized_on_left(
     ref_audios: str | list[str],
     ref_texts: str | list[str],
     gen_texts: str | list[str],
@@ -832,7 +832,7 @@ def infer_batch(
             gen_chunk = " " + gen_chunk + " "
 
             # TODO. currently, use the same speed for all samples
-            if len(gen_text.encode("utf-8")) < 10:
+            if len(gen_chunk.encode("utf-8")) < 10:
                 local_speed = 0.3
 
             audio_list.append(audio)  # audio shape is [1, N]
@@ -873,67 +873,42 @@ def infer_batch(
         generated = generated.to(torch.float32)
         generated = generated.permute(0, 2, 1)
 
-        if False:
-            # For debugging
-            import soundfile as sf
+        # Detect artifact frames for each generated mel spectrogram
+        mel_list = []
+        mel_lengths = []
+        mel_frames_trunc_list = []
 
-            for index in range(generated.size(0)):
-                dur = durations[index]
-                ref_audio_len = ref_audio_len_list[index]
-                print(dur, ref_audio_len)
-                wav = vocoder.decode(generated[index : index + 1, :, : dur - ref_audio_len]).squeeze().cpu().numpy()
-                # wav = vocoder.decode(generated[index: index + 1, :, :]).squeeze().cpu().numpy()
-                print(wav.shape)
-                sf.write(f"temp/{index}.wav", wav, 24000)
-            exit()
+        for index in range(generated.size(0)):
+            # Get the mel spectrogram for this sample (excluding reference audio part)
+            dur = durations[index]
+            ref_audio_len = ref_audio_len_list[index]
+            mel = generated[index, :, : dur - ref_audio_len]
 
-        if False:
-            generated_waves = vocoder.decode(generated).cpu().numpy()  # [B, N]
-
-            generated_audio_list = []
-            for generated_wave, rms, dur, ref_audio_len in zip(generated_waves, rms_list, durations, ref_audio_len_list):
-                generated_wave = generated_wave[: (dur - ref_audio_len) * hop_length]
-                if rms < target_rms:
-                    generated_wave = generated_wave * rms / target_rms
-                generated_audio_list.append(generated_wave)
-
-        else:
-            # Detect artifact frames for each generated mel spectrogram
-            refined_mels = []
-            mel_lengths = []
-            mel_frames_trunc_list = []
-
-            for index in range(generated.size(0)):
-                # Get the mel spectrogram for this sample (excluding reference audio part)
-                dur = durations[index]
-                ref_audio_len = ref_audio_len_list[index]
-                mel = generated[index, :, : dur - ref_audio_len]
-
-                if mel_spec_type == "vocos":
-                    n_trunc = detect_vocos_mel_artifact_frames(mel, n_frames=n_mel_frames_trunc, threshold_drop=-0.5)
-                else:
-                    n_trunc = detect_bigvgan_mel_artifact_frames(mel, n_frames=n_mel_frames_trunc, threshold_drop=-0.5)
-
-                mel_frames_trunc_list.append(n_trunc)
-                mel = mel[:, : mel.size(1) - n_trunc]
-                refined_mels.append(mel)
-                mel_lengths.append(mel.size(1))
-
-            print("mel_trunc_list =", mel_frames_trunc_list)
-            print("mel_lengths =", mel_lengths)
-
-            refined_mels, _ = pad_2d(refined_mels, pad_value=0.0)
             if mel_spec_type == "vocos":
-                generated_waves = vocoder.decode(refined_mels).cpu().numpy()  # [B, N]
+                n_trunc = detect_vocos_mel_artifact_frames(mel, n_frames=n_mel_frames_trunc, threshold_drop=-0.5)
             else:
-                generated_waves = vocoder(refined_mels).cpu().numpy()  # [B, N]
+                n_trunc = detect_bigvgan_mel_artifact_frames(mel, n_frames=n_mel_frames_trunc, threshold_drop=-0.5)
 
-            generated_audio_list = []
-            for generated_wave, rms, mel_len in zip(generated_waves, rms_list, mel_lengths):
-                generated_wave = generated_wave[: mel_len * hop_length]
-                if rms < target_rms:
-                    generated_wave = generated_wave * rms / target_rms
-                generated_audio_list.append(generated_wave)
+            mel_frames_trunc_list.append(n_trunc)
+            mel = mel[:, : mel.size(1) - n_trunc]
+            mel_list.append(mel)
+            mel_lengths.append(mel.size(1))
+
+        print("mel_trunc_list =", mel_frames_trunc_list)
+        print("mel_lengths =", mel_lengths)
+
+        mel_list, _ = pad_2d(mel_list, pad_value=0.0)
+        if mel_spec_type == "vocos":
+            generated_waves = vocoder.decode(mel_list).cpu().numpy()  # [B, N]
+        else:
+            generated_waves = vocoder(mel_list).cpu().numpy()  # [B, N]
+
+        generated_audio_list = []
+        for generated_wave, rms, mel_len in zip(generated_waves, rms_list, mel_lengths):
+            generated_wave = generated_wave[: mel_len * hop_length]
+            if rms < target_rms:
+                generated_wave = generated_wave * rms / target_rms
+            generated_audio_list.append(generated_wave)
 
     start = 0
     final_audio_list: list[np.ndarray] = []

@@ -19,7 +19,7 @@ from f5_tts.infer.utils_infer import (
     cross_fade_duration,
     device,
     fix_duration,
-    infer_batch,
+    infer_batch_synthesized_on_left,
     infer_process,
     load_model,
     load_vocoder,
@@ -341,10 +341,10 @@ def main():
         # for testing infer_batch
         ref_audio_ = [ref_audio_, ref_audio_]
         ref_text_ = [ref_text_, ref_text_]
-        gen_text_ = [gen_text_, "I'm currently focusing."]
+        gen_text_ = [gen_text_, "tối nay đi chơi thôi."]
 
         # audio_segment, final_sample_rate, spectrogram = infer_process(
-        audio_segment, final_sample_rate = infer_batch(
+        audio_segment, final_sample_rate = infer_batch_synthesized_on_left(
             ref_audio_,
             ref_text_,
             gen_text_,

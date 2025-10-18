@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=0 python src/f5_tts/train/train.py

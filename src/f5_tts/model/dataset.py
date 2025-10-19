@@ -172,16 +172,23 @@ class DynamicBatchSampler(Sampler[list[int]]):
     """
 
     def __init__(
-        self, sampler: Sampler[int], frames_threshold: int, max_samples=0, random_seed=None, drop_residual: bool = False
+        self, sampler: Sampler[int], frames_threshold: int, max_samples=0, random_seed=None, drop_residual: bool = False, num_replicas: int = 1, rank: int = 0
     ):
         self.sampler = sampler
         self.frames_threshold = frames_threshold
         self.max_samples = max_samples
         self.random_seed = random_seed
         self.epoch = 0
+        self.num_replicas = num_replicas
+        self.rank = rank
 
         indices, batches = [], []
-        data_source = self.sampler.data_source
+        if hasattr(self.sampler, "data_source"):
+            data_source = self.sampler.data_source
+        elif hasattr(self.sampler, "dataset"):
+            data_source = self.sampler.dataset
+        else:
+            raise NotImplementedError(self.sampler)
 
         for idx in tqdm(self.sampler, desc="Sorting with sampler... if slow, check whether dataset is provided with duration"):
             indices.append((idx, data_source.get_frame_len(idx)))
@@ -226,9 +233,19 @@ class DynamicBatchSampler(Sampler[list[int]]):
             batches = [self.batches[i] for i in indices]
         else:
             batches = self.batches
+
+        # Distribute batches across GPUs if num_replicas > 1
+        if self.num_replicas > 1:
+            # Each GPU gets every num_replicas-th batch starting from its rank
+            # Example with 2 GPUs: GPU0 gets batches [0,2,4,...], GPU1 gets batches [1,3,5,...]
+            batches = batches[self.rank::self.num_replicas]
+
         return iter(batches)
 
     def __len__(self):
+        # Return number of batches this GPU will process
+        if self.num_replicas > 1:
+            return len(self.batches) // self.num_replicas + (1 if self.rank < len(self.batches) % self.num_replicas else 0)
         return len(self.batches)
 
 

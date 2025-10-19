@@ -190,6 +190,8 @@ class Trainer:
                 self.writer.add_scalar("test_loss", avg_loss, global_update)
 
         self.model.train()
+        # Ensure all processes finish evaluation before continuing
+        self.accelerator.wait_for_everyone()
         return avg_loss
 
     def save_checkpoint(self, update, last=False, epoch=None):
@@ -352,6 +354,7 @@ class Trainer:
             )
         elif self.batch_size_type == "frame":
             self.accelerator.even_batches = False
+            # Create batches on all data, then distribute across GPUs
             sampler = SequentialSampler(train_dataset)
             batch_sampler = DynamicBatchSampler(
                 sampler,
@@ -359,6 +362,8 @@ class Trainer:
                 max_samples=self.max_samples,
                 random_seed=resumable_with_seed,  # This enables reproducible shuffling
                 drop_residual=False,
+                num_replicas=self.accelerator.num_processes,  # Number of GPUs
+                rank=self.accelerator.process_index,  # Current GPU rank
             )
             train_dataloader = DataLoader(
                 train_dataset,
@@ -386,6 +391,7 @@ class Trainer:
                 )
             elif self.batch_size_type == "frame":
                 self.accelerator.even_batches = False
+                # Create batches on all data for test set, then distribute across GPUs
                 test_sampler = SequentialSampler(test_dataset)
                 test_batch_sampler = DynamicBatchSampler(
                     test_sampler,
@@ -393,6 +399,8 @@ class Trainer:
                     max_samples=self.max_samples,
                     random_seed=None,  # No shuffling for test set
                     drop_residual=False,
+                    num_replicas=self.accelerator.num_processes,  # Number of GPUs
+                    rank=self.accelerator.process_index,  # Current GPU rank
                 )
                 test_dataloader = DataLoader(
                     test_dataset,
@@ -436,6 +444,8 @@ class Trainer:
             self.evaluate(test_dataloader, global_update)
 
         for epoch in tqdm(list(range(skipped_epoch, self.epochs)), desc="Training"):
+            # Synchronize all processes at the start of each epoch
+            self.accelerator.wait_for_everyone()
             self.model.train()
             if exists(resumable_with_seed) and epoch == skipped_epoch:
                 progress_bar_initial = math.ceil(skipped_batch / self.grad_accumulation_steps)
@@ -444,9 +454,10 @@ class Trainer:
                 progress_bar_initial = 0
                 current_dataloader = train_dataloader
 
-            # Set epoch for the batch sampler if it exists
-            if hasattr(train_dataloader, "batch_sampler") and hasattr(train_dataloader.batch_sampler, "set_epoch"):
-                train_dataloader.batch_sampler.set_epoch(epoch)
+            # Set epoch for DynamicBatchSampler if it exists
+            if self.batch_size_type == "frame":
+                if hasattr(train_dataloader, "batch_sampler") and hasattr(train_dataloader.batch_sampler, "set_epoch"):
+                    train_dataloader.batch_sampler.set_epoch(epoch)
 
             progress_bar = tqdm(
                 range(math.ceil(len(train_dataloader) / self.grad_accumulation_steps)),

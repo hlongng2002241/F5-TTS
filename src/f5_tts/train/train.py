@@ -7,7 +7,7 @@ import hydra
 from omegaconf import OmegaConf
 
 from f5_tts.model import CFM, Trainer
-from f5_tts.model.dataset import load_dataset
+from f5_tts.model.dataset import load_dataset, load_jsonl_dataset
 from f5_tts.model.utils import get_tokenizer
 
 
@@ -53,6 +53,7 @@ def main(model_cfg):
         grad_accumulation_steps=model_cfg.optim.grad_accumulation_steps,
         max_grad_norm=model_cfg.optim.max_grad_norm,
         logger=model_cfg.ckpts.logger,
+        logging_step=10,
         wandb_project="CFM-TTS",
         wandb_run_name=exp_name,
         wandb_resume_id=wandb_resume_id,
@@ -65,9 +66,14 @@ def main(model_cfg):
         model_cfg_dict=OmegaConf.to_container(model_cfg, resolve=True),
     )
 
-    train_dataset = load_dataset(model_cfg.datasets.name, tokenizer, mel_spec_kwargs=model_cfg.model.mel_spec)
+    # train_dataset = load_dataset(model_cfg.datasets.name, tokenizer, mel_spec_kwargs=model_cfg.model.mel_spec)
+    train_dataset = load_jsonl_dataset(model_cfg.datasets.train_path)
+    test_dataset = load_jsonl_dataset(model_cfg.datasets.test_path)
     trainer.train(
         train_dataset,
+        test_dataset,
+        eval_first=model_cfg.optim.eval_first,
+        resume_from_checkpoint=model_cfg.ckpts.resume_from_checkpoint,
         num_workers=model_cfg.datasets.num_workers,
         resumable_with_seed=666,  # seed for shuffling dataset
     )

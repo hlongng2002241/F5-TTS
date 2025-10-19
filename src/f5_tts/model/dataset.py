@@ -1,4 +1,5 @@
 import json
+import jsonlines
 from importlib.resources import files
 
 import torch
@@ -116,9 +117,7 @@ class CustomDataset(Dataset):
             )
 
     def get_frame_len(self, index):
-        if (
-            self.durations is not None
-        ):  # Please make sure the separately provided durations are correct, otherwise 99.99% OOM
+        if self.durations is not None:  # Please make sure the separately provided durations are correct, otherwise 99.99% OOM
             return self.durations[index] * self.target_sample_rate / self.hop_length
         return self.data[index]["duration"] * self.target_sample_rate / self.hop_length
 
@@ -184,17 +183,13 @@ class DynamicBatchSampler(Sampler[list[int]]):
         indices, batches = [], []
         data_source = self.sampler.data_source
 
-        for idx in tqdm(
-            self.sampler, desc="Sorting with sampler... if slow, check whether dataset is provided with duration"
-        ):
+        for idx in tqdm(self.sampler, desc="Sorting with sampler... if slow, check whether dataset is provided with duration"):
             indices.append((idx, data_source.get_frame_len(idx)))
-        indices.sort(key=lambda elem: elem[1])
+        indices.sort(key=lambda elem: elem[1], reverse=True)
 
         batch = []
         batch_frames = 0
-        for idx, frame_len in tqdm(
-            indices, desc=f"Creating dynamic batches with {frames_threshold} audio frames per gpu"
-        ):
+        for idx, frame_len in tqdm(indices, desc=f"Creating dynamic batches with {frames_threshold} audio frames per gpu"):
             if batch_frames + frame_len <= self.frames_threshold and (max_samples == 0 or len(batch) < max_samples):
                 batch.append(idx)
                 batch_frames += frame_len
@@ -286,9 +281,7 @@ def load_dataset(
         with open(f"{dataset_name}/duration.json", "r", encoding="utf-8") as f:
             data_dict = json.load(f)
         durations = data_dict["duration"]
-        train_dataset = CustomDataset(
-            train_dataset, durations=durations, preprocessed_mel=preprocessed_mel, **mel_spec_kwargs
-        )
+        train_dataset = CustomDataset(train_dataset, durations=durations, preprocessed_mel=preprocessed_mel, **mel_spec_kwargs)
 
     elif dataset_type == "HFDataset":
         print(
@@ -301,6 +294,12 @@ def load_dataset(
         )
 
     return train_dataset
+
+
+def load_jsonl_dataset(path: str):
+    with jsonlines.open(path) as f:
+        dataset = list(f)
+    return CustomDataset(dataset)
 
 
 # collation

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import random
+from typing import Any
 from collections import defaultdict
 from importlib.resources import files
 
@@ -31,7 +32,7 @@ def exists(v):
     return v is not None
 
 
-def default(v, d):
+def default(v, d) -> Any:
     return v if exists(v) else d
 
 
@@ -136,6 +137,7 @@ def get_tokenizer(dataset_name, tokenizer: str = "pinyin"):
             for i, char in enumerate(f):
                 vocab_char_map[char[:-1]] = i
         vocab_size = len(vocab_char_map)
+        assert vocab_char_map[" "] == 0, "make sure space is of idx 0 in vocab.txt, cuz 0 is used for unknown char"
 
     return vocab_char_map, vocab_size
 

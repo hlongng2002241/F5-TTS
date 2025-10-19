@@ -41,6 +41,7 @@ class Trainer:
         noise_scheduler: str | None = None,
         duration_predictor: torch.nn.Module | None = None,
         logger: str | None = "wandb",  # "wandb" | "tensorboard" | None
+        logging_step: int = 10,
         wandb_project="test_f5-tts",
         wandb_run_name="test_run",
         wandb_resume_id: str = None,
@@ -68,6 +69,7 @@ class Trainer:
         )
 
         self.logger = logger
+        self.logging_step = logging_step
         if self.logger == "wandb":
             if exists(wandb_resume_id):
                 init_kwargs = {"wandb": {"resume": "allow", "name": wandb_run_name, "id": wandb_resume_id}}
@@ -96,7 +98,8 @@ class Trainer:
         elif self.logger == "tensorboard":
             from torch.utils.tensorboard import SummaryWriter
 
-            self.writer = SummaryWriter(log_dir=f"runs/{wandb_run_name}")
+            assert checkpoint_path is not None
+            self.writer = SummaryWriter(log_dir=os.path.join(checkpoint_path, "tensorboard"))
 
         self.model = model
 
@@ -144,7 +147,52 @@ class Trainer:
     def is_main(self):
         return self.accelerator.is_main_process
 
-    def save_checkpoint(self, update, last=False):
+    def evaluate(self, test_dataloader, global_update):
+        """Evaluate model on test dataset."""
+        self.model.eval()
+        total_loss = 0
+        num_batches = 0
+
+        pbar = tqdm(
+            test_dataloader,
+            desc="Evaluating",
+            disable=not self.accelerator.is_local_main_process,
+            position=2,
+        )
+        with torch.no_grad():
+            for batch in pbar:
+                text_inputs = batch["text"]
+                mel_spec = batch["mel"].permute(0, 2, 1)
+                mel_lengths = batch["mel_lengths"]
+
+                loss, cond, pred = self.model(
+                    mel_spec, text=text_inputs, lens=mel_lengths, noise_scheduler=self.noise_scheduler
+                )
+
+                total_loss += loss.item()
+                num_batches += 1
+                
+                pbar.set_postfix(batch_size=len(text_inputs))
+
+        avg_loss = total_loss / num_batches if num_batches > 0 else 0
+
+        # Gather losses from all processes
+        avg_loss_tensor = torch.tensor(avg_loss, device=self.accelerator.device)
+        avg_loss_tensor = self.accelerator.gather(avg_loss_tensor).mean()
+
+        if self.accelerator.is_local_main_process:
+            avg_loss = avg_loss_tensor.item()
+            print(f"\nTest Loss: {avg_loss:.4f}")
+
+            # Log to wandb/tensorboard
+            self.accelerator.log({"test_loss": avg_loss}, step=global_update)
+            if self.logger == "tensorboard":
+                self.writer.add_scalar("test_loss", avg_loss, global_update)
+
+        self.model.train()
+        return avg_loss
+
+    def save_checkpoint(self, update, last=False, epoch=None):
         self.accelerator.wait_for_everyone()
         if self.is_main:
             checkpoint = dict(
@@ -159,6 +207,12 @@ class Trainer:
             if last:
                 self.accelerator.save(checkpoint, f"{self.checkpoint_path}/model_last.pt")
                 print(f"Saved last checkpoint at update {update}")
+            elif epoch is not None:
+                # Save epoch checkpoint
+                if self.keep_last_n_checkpoints == 0:
+                    return
+                self.accelerator.save(checkpoint, f"{self.checkpoint_path}/model_epoch{epoch}_update{update}.pt")
+                print(f"Saved epoch {epoch} checkpoint at update {update}")
             else:
                 if self.keep_last_n_checkpoints == 0:
                     return
@@ -179,8 +233,11 @@ class Trainer:
                         os.remove(os.path.join(self.checkpoint_path, oldest_checkpoint))
                         print(f"Removed old checkpoint: {oldest_checkpoint}")
 
-    def load_checkpoint(self):
-        if (
+    def load_checkpoint(self, resume_from_checkpoint: str=None) -> int:
+        latest_checkpoint = None
+        if resume_from_checkpoint is not None:
+            latest_checkpoint = resume_from_checkpoint
+        elif (
             not exists(self.checkpoint_path)
             or not os.path.exists(self.checkpoint_path)
             or not any(filename.endswith((".pt", ".safetensors")) for filename in os.listdir(self.checkpoint_path))
@@ -188,8 +245,11 @@ class Trainer:
             return 0
 
         self.accelerator.wait_for_everyone()
-        if "model_last.pt" in os.listdir(self.checkpoint_path):
+        if latest_checkpoint is not None:
+            pass
+        elif "model_last.pt" in os.listdir(self.checkpoint_path):
             latest_checkpoint = "model_last.pt"
+            latest_checkpoint = os.path.join(self.checkpoint_path, latest_checkpoint)
         else:
             # Updated to consider pretrained models for loading but prioritize training checkpoints
             all_checkpoints = [
@@ -209,16 +269,18 @@ class Trainer:
                 # If no training checkpoints, use pretrained model
                 latest_checkpoint = next(f for f in all_checkpoints if f.startswith("pretrained_"))
 
+            latest_checkpoint = os.path.join(self.checkpoint_path, latest_checkpoint)
+
+        print("Loading checkpoint at", latest_checkpoint)
+
         if latest_checkpoint.endswith(".safetensors"):  # always a pretrained checkpoint
             from safetensors.torch import load_file
 
-            checkpoint = load_file(f"{self.checkpoint_path}/{latest_checkpoint}", device="cpu")
+            checkpoint = load_file(latest_checkpoint, device="cpu")
             checkpoint = {"ema_model_state_dict": checkpoint}
         elif latest_checkpoint.endswith(".pt"):
             # checkpoint = torch.load(f"{self.checkpoint_path}/{latest_checkpoint}", map_location=self.accelerator.device)  # rather use accelerator.load_state ಥ_ಥ
-            checkpoint = torch.load(
-                f"{self.checkpoint_path}/{latest_checkpoint}", weights_only=True, map_location="cpu"
-            )
+            checkpoint = torch.load(latest_checkpoint, weights_only=True, map_location="cpu")
 
         # patch for backward compatibility, 305e3ea
         for key in ["ema_model.mel_spec.mel_stft.mel_scale.fb", "ema_model.mel_spec.mel_stft.spectrogram.window"]:
@@ -257,14 +319,15 @@ class Trainer:
 
         del checkpoint
         gc.collect()
+        assert isinstance(update, int)
         return update
 
-    def train(self, train_dataset: Dataset, num_workers=16, resumable_with_seed: int = None):
+    def train(self, train_dataset: Dataset, test_dataset: Dataset=None, eval_first=False, resume_from_checkpoint: str=None, num_workers=16, resumable_with_seed: int = None):
         if self.log_samples:
             from f5_tts.infer.utils_infer import cfg_strength, load_vocoder, nfe_step, sway_sampling_coef
 
             vocoder = load_vocoder(
-                vocoder_name=self.vocoder_name, is_local=self.is_local_vocoder, local_path=self.local_vocoder_path
+                vocoder_name=self.vocoder_name, is_local=self.is_local_vocoder, local_path=self.local_vocoder_path, device="cpu",
             )
             target_sample_rate = self.accelerator.unwrap_model(self.model).mel_spec.target_sample_rate
             log_samples_path = f"{self.checkpoint_path}/samples"
@@ -308,6 +371,39 @@ class Trainer:
         else:
             raise ValueError(f"batch_size_type must be either 'sample' or 'frame', but received {self.batch_size_type}")
 
+        # Create test dataloader (same configuration as train dataloader)
+        test_dataloader = None
+        if test_dataset is not None:
+            if self.batch_size_type == "sample":
+                test_dataloader = DataLoader(
+                    test_dataset,
+                    collate_fn=collate_fn,
+                    num_workers=num_workers,
+                    pin_memory=True,
+                    persistent_workers=True,
+                    batch_size=self.batch_size_per_gpu,
+                    shuffle=False,
+                )
+            elif self.batch_size_type == "frame":
+                self.accelerator.even_batches = False
+                test_sampler = SequentialSampler(test_dataset)
+                test_batch_sampler = DynamicBatchSampler(
+                    test_sampler,
+                    self.batch_size_per_gpu,
+                    max_samples=self.max_samples,
+                    random_seed=None,  # No shuffling for test set
+                    drop_residual=False,
+                )
+                test_dataloader = DataLoader(
+                    test_dataset,
+                    collate_fn=collate_fn,
+                    num_workers=num_workers,
+                    pin_memory=True,
+                    persistent_workers=True,
+                    batch_sampler=test_batch_sampler,
+                )
+            test_dataloader = self.accelerator.prepare(test_dataloader)
+
         #  accelerator.prepare() dispatches batches to devices;
         #  which means the length of dataloader calculated before, should consider the number of devices
         warmup_updates = (
@@ -324,7 +420,7 @@ class Trainer:
         train_dataloader, self.scheduler = self.accelerator.prepare(
             train_dataloader, self.scheduler
         )  # actual multi_gpu updates = single_gpu updates / gpu nums
-        start_update = self.load_checkpoint()
+        start_update = self.load_checkpoint(resume_from_checkpoint)
         global_update = start_update
 
         if exists(resumable_with_seed):
@@ -336,7 +432,10 @@ class Trainer:
         else:
             skipped_epoch = 0
 
-        for epoch in range(skipped_epoch, self.epochs):
+        if eval_first:
+            self.evaluate(test_dataloader, global_update)
+
+        for epoch in tqdm(list(range(skipped_epoch, self.epochs)), desc="Training"):
             self.model.train()
             if exists(resumable_with_seed) and epoch == skipped_epoch:
                 progress_bar_initial = math.ceil(skipped_batch / self.grad_accumulation_steps)
@@ -355,6 +454,7 @@ class Trainer:
                 unit="update",
                 disable=not self.accelerator.is_local_main_process,
                 initial=progress_bar_initial,
+                position=1,
             )
 
             for batch in current_dataloader:
@@ -386,9 +486,9 @@ class Trainer:
 
                     global_update += 1
                     progress_bar.update(1)
-                    progress_bar.set_postfix(update=str(global_update), loss=loss.item())
+                    progress_bar.set_postfix(update=str(global_update), loss=loss.item(), batch_size=len(text_inputs))
 
-                if self.accelerator.is_local_main_process:
+                if self.accelerator.is_local_main_process and global_update % self.logging_step == 0:
                     self.accelerator.log(
                         {"loss": loss.item(), "lr": self.scheduler.get_last_lr()[0]}, step=global_update
                     )
@@ -401,6 +501,10 @@ class Trainer:
 
                 if global_update % self.save_per_updates == 0 and self.accelerator.sync_gradients:
                     self.save_checkpoint(global_update)
+
+                    # Evaluate after saving checkpoint
+                    if test_dataloader is not None:
+                        self.evaluate(test_dataloader, global_update)
 
                     if self.log_samples and self.accelerator.is_local_main_process:
                         ref_audio_len = mel_lengths[0]
@@ -417,14 +521,14 @@ class Trainer:
                                 sway_sampling_coef=sway_sampling_coef,
                             )
                             generated = generated.to(torch.float32)
-                            gen_mel_spec = generated[:, ref_audio_len:, :].permute(0, 2, 1).to(self.accelerator.device)
-                            ref_mel_spec = batch["mel"][0].unsqueeze(0)
+                            gen_mel_spec = generated[:, ref_audio_len:, :].permute(0, 2, 1).cpu()
+                            ref_mel_spec = batch["mel"][0].unsqueeze(0).cpu()
                             if self.vocoder_name == "vocos":
-                                gen_audio = vocoder.decode(gen_mel_spec).cpu()
-                                ref_audio = vocoder.decode(ref_mel_spec).cpu()
+                                gen_audio = vocoder.decode(gen_mel_spec)
+                                ref_audio = vocoder.decode(ref_mel_spec)
                             elif self.vocoder_name == "bigvgan":
-                                gen_audio = vocoder(gen_mel_spec).squeeze(0).cpu()
-                                ref_audio = vocoder(ref_mel_spec).squeeze(0).cpu()
+                                gen_audio = vocoder(gen_mel_spec).squeeze(0)
+                                ref_audio = vocoder(ref_mel_spec).squeeze(0)
 
                         torchaudio.save(
                             f"{log_samples_path}/update_{global_update}_gen.wav", gen_audio, target_sample_rate
@@ -433,6 +537,12 @@ class Trainer:
                             f"{log_samples_path}/update_{global_update}_ref.wav", ref_audio, target_sample_rate
                         )
                         self.model.train()
+
+            # Save checkpoint and evaluate at the end of each epoch
+            progress_bar.close()
+            self.save_checkpoint(global_update, epoch=epoch)
+            if test_dataloader is not None:
+                self.evaluate(test_dataloader, global_update)
 
         self.save_checkpoint(global_update, last=True)
 

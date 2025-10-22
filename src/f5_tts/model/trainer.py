@@ -192,6 +192,8 @@ class Trainer:
         self.model.train()
         # Ensure all processes finish evaluation before continuing
         self.accelerator.wait_for_everyone()
+        print(dict(test_loss=avg_loss))
+        
         return avg_loss
 
     def save_checkpoint(self, update, last=False, epoch=None):
@@ -290,6 +292,9 @@ class Trainer:
                 del checkpoint["ema_model_state_dict"][key]
 
         if self.is_main:
+            # Use strict=False for pretrained models that don't have EMA tracking params (initted, step)
+            # strict = "initted" in checkpoint["ema_model_state_dict"] and "step" in checkpoint["ema_model_state_dict"]
+            # self.ema_model.load_state_dict(checkpoint["ema_model_state_dict"], strict=strict)
             self.ema_model.load_state_dict(checkpoint["ema_model_state_dict"])
 
         if "update" in checkpoint or "step" in checkpoint:

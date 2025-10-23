@@ -23,7 +23,7 @@ from f5_tts.model.utils import default, exists
 # trainer
 
 
-class Trainer:
+class TrainerMAS:
     def __init__(
         self,
         model: CFM,
@@ -54,6 +54,13 @@ class Trainer:
         is_local_vocoder: bool = False,  # use local path vocoder
         local_vocoder_path: str = "",  # local vocoder path
         model_cfg_dict: dict = dict(),  # training config
+        # MAS-specific parameters
+        use_mas: bool = False,
+        mas_warmup_steps_alpha: int = 150000,
+        mas_warmup_steps_temperature: int = 100000,
+        duration_loss_weight: float = 0.1,
+        lr_mas_components: float = 1e-4,
+        lr_v0v1_components: float = 1e-5,
     ):
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
@@ -133,12 +140,52 @@ class Trainer:
 
         self.duration_predictor = duration_predictor
 
+        # MAS-specific settings
+        self.use_mas = use_mas
+        self.mas_warmup_steps_alpha = mas_warmup_steps_alpha
+        self.mas_warmup_steps_temperature = mas_warmup_steps_temperature
+        self.duration_loss_weight = duration_loss_weight
+        self.lr_mas_components = lr_mas_components
+        self.lr_v0v1_components = lr_v0v1_components
+
+        # Validation: trainer_mas.py requires MAS to be enabled
+        assert self.use_mas, "trainer_mas.py requires use_mas=True"
+        assert self.duration_predictor is not None, "MAS training requires duration_predictor"
+        assert hasattr(model, "use_mas") and model.use_mas, "Model must have use_mas=True for MAS training"
+
+        # Setup optimizer with parameter groups for MAS
+        # Split parameters into V0/V1 components and MAS components
+        mas_param_names = {"similarity_proj", "duration_predictor", "mel_feature_proj"}
+
+        v0v1_params = []
+        mas_params = {}
+
+        for name, param in model.named_parameters():
+            if any(mas_name in name for mas_name in mas_param_names):
+                assert name not in mas_params
+                mas_params[name] = param
+            else:
+                v0v1_params.append(param)
+
+        param_groups = [
+            {"params": v0v1_params, "lr": self.lr_v0v1_components},
+            {"params": list(mas_params.values()), "lr": self.lr_mas_components},
+        ]
+
         if bnb_optimizer:
             import bitsandbytes as bnb
 
-            self.optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=learning_rate)
+            self.optimizer = bnb.optim.AdamW8bit(param_groups)
         else:
-            self.optimizer = AdamW(model.parameters(), lr=learning_rate)
+            self.optimizer = AdamW(param_groups)
+
+        if self.is_main:
+            print(
+                f"MAS Training: Using separate learning rates - V0/V1: {self.lr_v0v1_components}, MAS: {self.lr_mas_components}"
+            )
+            print(f"  - V0/V1 parameters: {len(v0v1_params)}")
+            print(f"  - MAS parameters: {len(mas_params)} | {mas_params.keys()}")
+
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
 
     @property
@@ -163,7 +210,15 @@ class Trainer:
                 mel_spec = batch["mel"].permute(0, 2, 1)
                 mel_lengths = batch["mel_lengths"]
 
-                loss, cond, pred = self.model(mel_spec, text=text_inputs, lens=mel_lengths, noise_scheduler=self.noise_scheduler)
+                # Handle different return formats (standard vs MAS)
+                model_output = self.model(
+                    mel_spec,
+                    text=text_inputs,
+                    lens=mel_lengths,
+                    noise_scheduler=self.noise_scheduler,
+                    returns_text_tokens=False,  # Don't need text tokens during evaluation
+                )
+                loss, cond, pred = model_output[:3]  # Only take first 3 values
 
                 total_loss += loss.item()
                 num_batches += 1
@@ -484,18 +539,42 @@ class Trainer:
                     mel_spec = batch["mel"].permute(0, 2, 1)
                     mel_lengths = batch["mel_lengths"]
 
-                    # TODO. add duration predictor training
-                    if self.duration_predictor is not None and self.accelerator.is_local_main_process:
-                        dur_loss = self.duration_predictor(mel_spec, lens=batch.get("durations"))
-                        self.accelerator.log({"duration loss": dur_loss.item()}, step=global_update)
+                    # Update MAS parameters (alpha and temperature) for gradual mixing
+                    from f5_tts.model.utils import update_mas_alpha, update_mas_temperature
 
-                    loss, cond, pred = self.model(
-                        mel_spec, text=text_inputs, lens=mel_lengths, noise_scheduler=self.noise_scheduler
+                    mas_alpha = update_mas_alpha(
+                        self.accelerator.unwrap_model(self.model), global_update, warmup_steps=self.mas_warmup_steps_alpha
                     )
-                    self.accelerator.backward(loss)
+                    mas_temperature = update_mas_temperature(
+                        self.accelerator.unwrap_model(self.model),
+                        global_update,
+                        warmup_steps=self.mas_warmup_steps_temperature,
+                    )
 
-                    if self.max_grad_norm > 0 and self.accelerator.sync_gradients:
-                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    # Forward pass - always returns extended output for MAS training
+                    model_output = self.model(
+                        mel_spec,
+                        text=text_inputs,
+                        lens=mel_lengths,
+                        noise_scheduler=self.noise_scheduler,
+                        returns_text_tokens=True,
+                    )
+
+                    # Unpack extended output: (loss, cond, pred, text, text_embed, attn, dur_loss)
+                    loss, cond, pred, text_tokens, text_embed, attn, dur_loss = model_output
+
+                    # Combine flow matching loss and duration loss
+                    total_loss = loss + self.duration_loss_weight * dur_loss
+
+                    self.accelerator.backward(total_loss)
+
+                    # Compute gradient norm before clipping
+                    grad_norm = 0.0
+                    if self.accelerator.sync_gradients:
+                        # Compute total gradient norm across all parameters
+                        grad_norm = self.accelerator.clip_grad_norm_(
+                            self.model.parameters(), self.max_grad_norm if self.max_grad_norm > 0 else float("inf")
+                        )
 
                     self.optimizer.step()
                     self.scheduler.step()
@@ -510,10 +589,28 @@ class Trainer:
                     progress_bar.set_postfix(update=str(global_update), loss=loss.item(), batch_size=len(text_inputs))
 
                 if self.accelerator.is_local_main_process and global_update % self.logging_step == 0:
-                    self.accelerator.log({"loss": loss.item(), "lr": self.scheduler.get_last_lr()[0]}, step=global_update)
+                    log_dict = {
+                        "loss": loss.item(),
+                        "lr": self.scheduler.get_last_lr()[0],
+                        "mas_alpha": mas_alpha,
+                        "mas_temperature": mas_temperature,
+                        "duration_loss": dur_loss.item() if torch.is_tensor(dur_loss) else dur_loss,
+                        "total_loss": total_loss.item(),
+                        "grad_norm": grad_norm,
+                    }
+
+                    self.accelerator.log(log_dict, step=global_update)
+
                     if self.logger == "tensorboard":
                         self.writer.add_scalar("loss", loss.item(), global_update)
                         self.writer.add_scalar("lr", self.scheduler.get_last_lr()[0], global_update)
+                        self.writer.add_scalar("mas_alpha", mas_alpha, global_update)
+                        self.writer.add_scalar("mas_temperature", mas_temperature, global_update)
+                        self.writer.add_scalar(
+                            "duration_loss", dur_loss.item() if torch.is_tensor(dur_loss) else dur_loss, global_update
+                        )
+                        self.writer.add_scalar("total_loss", total_loss.item(), global_update)
+                        self.writer.add_scalar("grad_norm", grad_norm, global_update)
 
                 if global_update % self.last_per_updates == 0 and self.accelerator.sync_gradients:
                     self.save_checkpoint(global_update, last=True)

@@ -109,7 +109,9 @@ class Trainer:
 
             print(f"Using logger: {logger}")
             if grad_accumulation_steps > 1:
-                print("Gradient accumulation checkpointing with per_updates now, old logic per_steps used with before f992c4e")
+                print(
+                    "Gradient accumulation checkpointing with per_updates now, old logic per_steps used with before f992c4e"
+                )
 
         self.epochs = epochs
         self.num_warmup_updates = num_warmup_updates
@@ -163,11 +165,13 @@ class Trainer:
                 mel_spec = batch["mel"].permute(0, 2, 1)
                 mel_lengths = batch["mel_lengths"]
 
-                loss, cond, pred = self.model(mel_spec, text=text_inputs, lens=mel_lengths, noise_scheduler=self.noise_scheduler)
+                loss, cond, pred = self.model(
+                    mel_spec, text=text_inputs, lens=mel_lengths, noise_scheduler=self.noise_scheduler
+                )
 
                 total_loss += loss.item()
                 num_batches += 1
-
+                
                 pbar.set_postfix(batch_size=len(text_inputs))
 
         avg_loss = total_loss / num_batches if num_batches > 0 else 0
@@ -189,7 +193,7 @@ class Trainer:
         # Ensure all processes finish evaluation before continuing
         self.accelerator.wait_for_everyone()
         print(dict(test_loss=avg_loss))
-
+        
         return avg_loss
 
     def save_checkpoint(self, update, last=False, epoch=None):
@@ -233,7 +237,7 @@ class Trainer:
                         os.remove(os.path.join(self.checkpoint_path, oldest_checkpoint))
                         print(f"Removed old checkpoint: {oldest_checkpoint}")
 
-    def load_checkpoint(self, resume_from_checkpoint: str = None) -> int:
+    def load_checkpoint(self, resume_from_checkpoint: str=None) -> int:
         latest_checkpoint = None
         if resume_from_checkpoint is not None:
             latest_checkpoint = resume_from_checkpoint
@@ -325,23 +329,12 @@ class Trainer:
         assert isinstance(update, int)
         return update
 
-    def train(
-        self,
-        train_dataset: Dataset,
-        test_dataset: Dataset = None,
-        eval_first=False,
-        resume_from_checkpoint: str = None,
-        num_workers=16,
-        resumable_with_seed: int = None,
-    ):
+    def train(self, train_dataset: Dataset, test_dataset: Dataset=None, eval_first=False, resume_from_checkpoint: str=None, num_workers=16, resumable_with_seed: int = None):
         if self.log_samples:
             from f5_tts.infer.utils_infer import cfg_strength, load_vocoder, nfe_step, sway_sampling_coef
 
             vocoder = load_vocoder(
-                vocoder_name=self.vocoder_name,
-                is_local=self.is_local_vocoder,
-                local_path=self.local_vocoder_path,
-                device="cpu",
+                vocoder_name=self.vocoder_name, is_local=self.is_local_vocoder, local_path=self.local_vocoder_path, device="cpu",
             )
             target_sample_rate = self.accelerator.unwrap_model(self.model).mel_spec.target_sample_rate
             log_samples_path = f"{self.checkpoint_path}/samples"
@@ -434,7 +427,9 @@ class Trainer:
         decay_updates = total_updates - warmup_updates
         warmup_scheduler = LinearLR(self.optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_updates)
         decay_scheduler = LinearLR(self.optimizer, start_factor=1.0, end_factor=1e-8, total_iters=decay_updates)
-        self.scheduler = SequentialLR(self.optimizer, schedulers=[warmup_scheduler, decay_scheduler], milestones=[warmup_updates])
+        self.scheduler = SequentialLR(
+            self.optimizer, schedulers=[warmup_scheduler, decay_scheduler], milestones=[warmup_updates]
+        )
         train_dataloader, self.scheduler = self.accelerator.prepare(
             train_dataloader, self.scheduler
         )  # actual multi_gpu updates = single_gpu updates / gpu nums
@@ -510,7 +505,9 @@ class Trainer:
                     progress_bar.set_postfix(update=str(global_update), loss=loss.item(), batch_size=len(text_inputs))
 
                 if self.accelerator.is_local_main_process and global_update % self.logging_step == 0:
-                    self.accelerator.log({"loss": loss.item(), "lr": self.scheduler.get_last_lr()[0]}, step=global_update)
+                    self.accelerator.log(
+                        {"loss": loss.item(), "lr": self.scheduler.get_last_lr()[0]}, step=global_update
+                    )
                     if self.logger == "tensorboard":
                         self.writer.add_scalar("loss", loss.item(), global_update)
                         self.writer.add_scalar("lr", self.scheduler.get_last_lr()[0], global_update)
@@ -527,7 +524,9 @@ class Trainer:
 
                     if self.log_samples and self.accelerator.is_local_main_process:
                         ref_audio_len = mel_lengths[0]
-                        infer_text = [text_inputs[0] + ([" "] if isinstance(text_inputs[0], list) else " ") + text_inputs[0]]
+                        infer_text = [
+                            text_inputs[0] + ([" "] if isinstance(text_inputs[0], list) else " ") + text_inputs[0]
+                        ]
                         with torch.inference_mode():
                             generated, _ = self.accelerator.unwrap_model(self.model).sample(
                                 cond=mel_spec[0][:ref_audio_len].unsqueeze(0),
@@ -547,8 +546,12 @@ class Trainer:
                                 gen_audio = vocoder(gen_mel_spec).squeeze(0)
                                 ref_audio = vocoder(ref_mel_spec).squeeze(0)
 
-                        torchaudio.save(f"{log_samples_path}/update_{global_update}_gen.wav", gen_audio, target_sample_rate)
-                        torchaudio.save(f"{log_samples_path}/update_{global_update}_ref.wav", ref_audio, target_sample_rate)
+                        torchaudio.save(
+                            f"{log_samples_path}/update_{global_update}_gen.wav", gen_audio, target_sample_rate
+                        )
+                        torchaudio.save(
+                            f"{log_samples_path}/update_{global_update}_ref.wav", ref_audio, target_sample_rate
+                        )
                         self.model.train()
 
             # Save checkpoint and evaluate at the end of each epoch

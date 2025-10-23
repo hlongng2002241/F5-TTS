@@ -28,12 +28,13 @@ from f5_tts.model.utils import (
     list_str_to_tensor,
     mask_from_frac_lengths,
 )
+from f5_tts.model.backbones.dit import DiT
 
 
 class CFM(nn.Module):
     def __init__(
         self,
-        transformer: nn.Module,
+        transformer: DiT,
         sigma=0.0,
         odeint_kwargs: dict = dict(
             # atol = 1e-5,
@@ -46,7 +47,8 @@ class CFM(nn.Module):
         mel_spec_module: nn.Module | None = None,
         mel_spec_kwargs: dict = dict(),
         frac_lengths_mask: tuple[float, float] = (0.7, 1.0),
-        vocab_char_map: dict[str:int] | None = None,
+        vocab_char_map: dict[str, int] | None = None,
+        use_mas=False,  # Enable MAS for alignment
     ):
         super().__init__()
 
@@ -74,6 +76,26 @@ class CFM(nn.Module):
 
         # vocab map for tokenization
         self.vocab_char_map = vocab_char_map
+
+        # MAS (Monotonic Alignment Search) components
+        self.use_mas = use_mas
+        if use_mas:
+            from f5_tts.model.duration_predictor import DurationPredictor
+
+            # Project mel features to text embedding dimension for similarity computation
+            text_dim = transformer.text_embed.text_embed.embedding_dim
+            self.mel_feature_proj = nn.Linear(num_channels, text_dim)
+
+            # Initialize duration predictor for MAS training
+            self.duration_predictor = DurationPredictor(
+                input_dim=text_dim,
+                hidden_dim=256,
+                num_layers=2,
+                dropout=0.1,
+            )
+        else:
+            self.mel_feature_proj = None
+            self.duration_predictor = None
 
     @property
     def device(self):
@@ -122,19 +144,49 @@ class CFM(nn.Module):
                 text = list_str_to_tensor(text).to(device)
             assert text.shape[0] == batch
 
+        # Predict durations using MAS duration predictor (if available)
+        duration_pred = None
+        text_lens = None
+        if self.use_mas:
+            # Get text embeddings for duration prediction
+            with torch.no_grad():
+                text_embed_raw = self.transformer.text_embed.text_embed(text)  # [b, nt, d]
+                text_mask = (text != -1).int()  # [b, nt]
+
+                # Predict log-durations
+                logw_pred = self.duration_predictor(text_embed_raw, text_mask).squeeze(-1)  # [b, nt]
+                # Use ceil() to ensure every token gets at least 1 frame (prevents text swallowing)
+                # Keep as float for generate_path() - no need to convert to int
+                duration_pred = torch.ceil(torch.exp(logw_pred)) * text_mask  # [b, nt]
+
+                # Compute text_lens for duration-based upsampling
+                text_lens = (text != -1).sum(dim=-1)  # [b]
+
         # duration
 
         cond_mask = lens_to_mask(lens)
         if edit_mask is not None:
             cond_mask = cond_mask & edit_mask
 
-        if isinstance(duration, int):
-            duration = torch.full((batch,), duration, device=device, dtype=torch.long)
+        # If using MAS with duration predictor, override duration with predicted values
+        if self.use_mas and duration_pred is not None:
+            # Use predicted durations to compute actual output length
+            predicted_duration = duration_pred.sum(dim=-1)  # [b] - sum of per-token durations
+            # Add reference audio length
+            predicted_duration = predicted_duration + lens
+            # Use predicted duration instead of estimation
+            duration = predicted_duration.long()
+            duration = duration.clamp(max=max_duration)
+        else:
+            if isinstance(duration, int):
+                duration = torch.full((batch,), duration, device=device, dtype=torch.long)
 
-        duration = torch.maximum(
-            torch.maximum((text != -1).sum(dim=-1), lens) + 1, duration
-        )  # duration at least text/audio prompt length plus one token, so something is generated
-        duration = duration.clamp(max=max_duration)
+            # Use estimated duration (character-count-based heuristic)
+            duration = torch.maximum(
+                torch.maximum((text != -1).sum(dim=-1), lens) + 1, duration
+            )  # duration at least text/audio prompt length plus one token, so something is generated
+            duration = duration.clamp(max=max_duration)
+
         max_duration = duration.amax()
 
         # duplicate test corner for inner time step oberservation
@@ -147,7 +199,7 @@ class CFM(nn.Module):
 
         if no_ref_audio:
             cond = torch.zeros_like(cond)
-        
+
         step_cond = torch.where(
             cond_mask, cond, torch.zeros_like(cond)
         )  # allow direct control (cut cond audio) with lens passed in
@@ -174,6 +226,8 @@ class CFM(nn.Module):
                     drop_audio_cond=False,
                     drop_text=False,
                     cache=True,
+                    duration_pred=duration_pred,
+                    text_lens=text_lens,
                 )
             else:
                 # predict flow (cond and uncond), for classifier-free guidance
@@ -185,6 +239,8 @@ class CFM(nn.Module):
                     mask=mask,
                     cfg_infer=True,
                     cache=True,
+                    duration_pred=duration_pred,
+                    text_lens=text_lens,
                 )
                 pred, null_pred = torch.chunk(pred_cfg, 2, dim=0)
                 pred = pred + (pred - null_pred) * cfg_strength
@@ -261,7 +317,7 @@ class CFM(nn.Module):
             cond = self.mel_spec(cond)
             cond = cond.permute(0, 2, 1)
             assert cond.shape[-1] == self.num_channels
-            
+
         cond = cond.to(next(self.parameters()).dtype)
 
         batch, cond_seq_len, device = *cond.shape[:2], cond.device
@@ -277,8 +333,26 @@ class CFM(nn.Module):
                 text = list_str_to_tensor(text).to(device)
             assert text.shape[0] == batch
 
+        # Predict durations using MAS duration predictor (if available)
+        duration_pred = None
+        text_lens = None
+        if self.use_mas:
+            # Get text embeddings for duration prediction
+            with torch.no_grad():
+                text_embed_raw = self.transformer.text_embed.text_embed(text)  # [b, nt, d]
+                text_mask = (text != -1).int()  # [b, nt]
+
+                # Predict log-durations
+                logw_pred = self.duration_predictor(text_embed_raw, text_mask).squeeze(-1)  # [b, nt]
+                # Use ceil() to ensure every token gets at least 1 frame (prevents text swallowing)
+                # Keep as float for generate_path() - no need to convert to int
+                duration_pred = torch.ceil(torch.exp(logw_pred)) * text_mask  # [b, nt]
+
+                # Compute text_lens for duration-based upsampling
+                text_lens = (text != -1).sum(dim=-1)  # [b]
+
         # duration
-        
+
         cond_mask = lens_to_mask(lens)
         if edit_mask is not None:
             cond_mask = cond_mask & edit_mask
@@ -286,33 +360,45 @@ class CFM(nn.Module):
         if isinstance(duration, int):
             duration = torch.full((batch,), duration, device=device, dtype=torch.long)
 
-        duration = torch.maximum(
-            torch.maximum((text != -1).sum(dim=-1), lens) + 1, duration
-        )  # duration at least text/audio prompt length plus one token, so something is generated
-        duration = duration.clamp(max=max_duration)
+        # If using MAS with duration predictor, override duration with predicted values
+        if self.use_mas and duration_pred is not None:
+            # Use predicted durations to compute actual output length
+            predicted_duration = duration_pred.sum(dim=-1)  # [b] - sum of per-token durations
+            # Add reference audio length
+            predicted_duration = predicted_duration + lens
+            # Use predicted duration instead of estimation
+            duration = predicted_duration.long()
+            duration = duration.clamp(max=max_duration)
+        else:
+            # Use estimated duration (character-count-based heuristic)
+            duration = torch.maximum(
+                torch.maximum((text != -1).sum(dim=-1), lens) + 1, duration
+            )  # duration at least text/audio prompt length plus one token, so something is generated
+            duration = duration.clamp(max=max_duration)
+
         max_duration = duration.amax()
-        
+
         # duplicate test corner for inner time step oberservation
         if duplicate_test:
             test_cond = F.pad(cond, (0, 0, cond_seq_len, max_duration - 2 * cond_seq_len), value=0.0)
 
-        # add cond audio to right, => sample left 
+        # add cond audio to right, => sample left
         tmp_cond = torch.zeros((cond.shape[0], max_duration, cond.shape[2]), dtype=cond.dtype, device=cond.device)
         cond_mask = torch.zeros((cond.shape[0], max_duration, 1), dtype=torch.bool, device=cond.device)
         for index, dur in enumerate(duration):
             end = dur - (cond.shape[1] - lens[index])
             start = end - lens[index]
-            tmp_cond[index, start : end] = cond[index]
-            cond_mask[index, start : end] = True
+            tmp_cond[index, start:end] = cond[index]
+            cond_mask[index, start:end] = True
         cond = tmp_cond
-        
+
         if no_ref_audio:
             cond = torch.zeros_like(cond)
 
         step_cond = torch.where(
             cond_mask, cond, torch.zeros_like(cond)
         )  # allow direct control (cut cond audio) with lens passed in
-        
+
         if batch > 1:
             mask = lens_to_mask(duration)
         else:  # save memory and speed up, as single inference need no mask currently
@@ -335,6 +421,8 @@ class CFM(nn.Module):
                     drop_audio_cond=False,
                     drop_text=False,
                     cache=True,
+                    duration_pred=duration_pred,
+                    text_lens=text_lens,
                 )
             else:
                 # predict flow (cond and uncond), for classifier-free guidance
@@ -346,6 +434,8 @@ class CFM(nn.Module):
                     mask=mask,
                     cfg_infer=True,
                     cache=True,
+                    duration_pred=duration_pred,
+                    text_lens=text_lens,
                 )
                 pred, null_pred = torch.chunk(pred_cfg, 2, dim=0)
                 pred = pred + (pred - null_pred) * cfg_strength
@@ -397,11 +487,12 @@ class CFM(nn.Module):
 
     def forward(
         self,
-        inp: float["b n d"] | float["b nw"],  # mel or raw wave  # noqa: F722
-        text: int["b nt"] | list[str],  # noqa: F722
+        inp: torch.Tensor | float["b n d"] | float["b nw"],  # mel or raw wave  # noqa: F722
+        text: torch.Tensor | int["b nt"] | list[str],  # noqa: F722
         *,
-        lens: int["b"] | None = None,  # noqa: F821
+        lens: torch.Tensor | int["b"] | None = None,  # noqa: F821
         noise_scheduler: str | None = None,
+        returns_text_tokens: bool = False,  # return text embeddings and attention for duration predictor
     ):
         # handle raw wave
         if inp.ndim == 2:
@@ -458,13 +549,60 @@ class CFM(nn.Module):
         else:
             drop_text = False
 
+        # Prepare MAS inputs if enabled
+        mel_features = None
+        text_lens = None
+        if self.use_mas:
+            # Project mel features for similarity computation
+            mel_features = self.mel_feature_proj(inp)  # [b, n, text_dim]
+            # Get actual text lengths (excluding padding)
+            text_lens = (text != -1).sum(dim=-1)
+
         # apply mask will use more memory; might adjust batchsize or batchsampler long sequence threshold
-        pred = self.transformer(
-            x=φ, cond=cond, text=text, time=time, drop_audio_cond=drop_audio_cond, drop_text=drop_text, mask=mask
+        result = self.transformer(
+            x=φ,
+            cond=cond,
+            text=text,
+            time=time,
+            drop_audio_cond=drop_audio_cond,
+            drop_text=drop_text,
+            mask=mask,
+            mel_features=mel_features,
+            text_lens=text_lens,
+            mel_lens=lens,
+            returns_text_embed=returns_text_tokens or (self.duration_predictor is not None),
         )
+
+        # Unpack result based on returns_text_embed
+        if returns_text_tokens or (self.duration_predictor is not None):
+            pred, text_embed, attn = result
+        else:
+            pred = result
+            text_embed = None
+            attn = None
 
         # flow matching loss
         loss = F.mse_loss(pred, flow, reduction="none")
         loss = loss[rand_span_mask]
+
+        # Duration prediction loss (if duration predictor is available and attn computed)
+        dur_loss = torch.tensor(0.0, device=device)
+        if self.duration_predictor is not None and attn is not None and text_embed is not None:
+            # Extract ground truth durations from attention
+            w = attn.sum(dim=2)  # [b, nt] - number of mel frames per text token
+            text_mask = (text != -1).int()  # [b, nt]
+
+            # Target: log duration
+            logw_target = torch.log(w + 1e-6) * text_mask
+
+            # Predict: log duration from text embeddings
+            logw_pred = self.duration_predictor(text_embed, text_mask).squeeze(-1)  # [b, nt]
+
+            # MSE loss on log durations
+            dur_loss = F.mse_loss(logw_pred * text_mask, logw_target, reduction="sum")
+            dur_loss = dur_loss / text_mask.sum().clamp(min=1.0)
+
+        if returns_text_tokens:
+            return loss.mean(), cond, pred, text, text_embed, attn, dur_loss
 
         return loss.mean(), cond, pred

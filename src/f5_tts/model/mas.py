@@ -45,8 +45,9 @@ def monotonic_alignment_search(
 
     # Transpose similarity to [b, t_y, t_x] format expected by Cython MAS
     # The algorithm treats first dim as target (mel), second as source (text)
-    similarity_transposed = similarity.transpose(1, 2)  # [b, n, nt]
-    mask_transposed = mask.transpose(1, 2)  # [b, n, nt]
+    # Use .contiguous() to ensure C-contiguous memory layout required by Cython
+    similarity_transposed = similarity.transpose(1, 2).contiguous()  # [b, n, nt]
+    mask_transposed = mask.transpose(1, 2).contiguous()  # [b, n, nt]
 
     # Run Cython MAS: returns path [b, n, nt]
     path = maximum_path(similarity_transposed, mask_transposed)

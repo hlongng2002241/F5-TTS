@@ -20,9 +20,10 @@ optim:
   max_grad_norm: 1.0  # gradient clipping
   bnb_optimizer: False  # use bnb 8bit AdamW optimizer or not
   eval_first: False
+  restart: False
 
 model:
-  name: F5TTS_Base  # model name
+  name: F5TTS_Base_mas  # model name
   tokenizer: pinyin  # tokenizer type
   tokenizer_path: null  # if 'custom' tokenizer, define the path want to use (should be vocab.txt)
   backbone: DiT

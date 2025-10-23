@@ -247,6 +247,84 @@ class TrainerMAS:
 
         return avg_loss
 
+    def _load_state_dict_with_mas_compatibility(self, model, checkpoint_state_dict, is_ema=False):
+        """
+        Load state dict with MAS compatibility.
+
+        Handles loading V0/V1 checkpoints (without MAS components) into MAS-enabled models.
+        Uses strict=True for matching parameters while gracefully skipping MAS components
+        that don't exist in the checkpoint.
+
+        Args:
+            model: The model to load into
+            checkpoint_state_dict: State dict from checkpoint
+            is_ema: Whether loading EMA model (keys have "ema_model." prefix)
+        """
+        # MAS component keys that may be missing in V0/V1 checkpoints
+        mas_key_suffixes = [
+            "transformer.text_embed.similarity_proj.weight",
+            "transformer.text_embed.similarity_proj.bias",
+            "transformer.text_embed.mas_alpha",
+            "transformer.text_embed.mas_temperature",
+            "mel_feature_proj.weight",
+            "mel_feature_proj.bias",
+            "duration_predictor.conv_1.weight",
+            "duration_predictor.conv_1.bias",
+            "duration_predictor.norm_1.gamma",
+            "duration_predictor.norm_1.beta",
+            "duration_predictor.conv_2.weight",
+            "duration_predictor.conv_2.bias",
+            "duration_predictor.norm_2.gamma",
+            "duration_predictor.norm_2.beta",
+            "duration_predictor.proj.weight",
+            "duration_predictor.proj.bias",
+        ]
+
+        # Add "ema_model." prefix if loading EMA model
+        if is_ema:
+            mas_keys = {f"ema_model.{k}" for k in mas_key_suffixes}
+        else:
+            mas_keys = set(mas_key_suffixes)
+
+        model_state_dict = model.state_dict()
+        checkpoint_keys = set(checkpoint_state_dict.keys())
+        model_keys = set(model_state_dict.keys())
+
+        # Check if checkpoint is missing MAS components
+        missing_mas_keys = mas_keys & model_keys - checkpoint_keys
+        print("missing_mas_keys =", missing_mas_keys)
+
+        if missing_mas_keys:
+            # Loading V0/V1 checkpoint into MAS model
+            model_type = "EMA model" if is_ema else "model"
+            print("\n" + "=" * 70)
+            print(f"Loading V0/V1 checkpoint (no MAS) into MAS-enabled {model_type}")
+            print("=" * 70)
+            print(f"MAS components will use initialized values:")
+            print(f"  - similarity_proj: identity matrix")
+            print(f"  - duration_predictor: random initialization")
+            print(f"  - mel_feature_proj: random initialization")
+            print("=" * 70 + "\n")
+
+            # Load only non-MAS parameters with strict=True
+            checkpoint_filtered = {k: v for k, v in checkpoint_state_dict.items() if k not in mas_keys}
+            model_filtered_keys = model_keys - mas_keys
+
+            # Verify no unexpected missing/extra keys (excluding MAS)
+            missing_keys = model_filtered_keys - checkpoint_keys
+            unexpected_keys = checkpoint_keys - model_keys - mas_keys
+
+            if missing_keys:
+                raise RuntimeError(f"Missing keys in checkpoint (non-MAS): {missing_keys}")
+            if unexpected_keys:
+                raise RuntimeError(f"Unexpected keys in checkpoint: {unexpected_keys}")
+
+            # Load with strict=False (only because of MAS keys)
+            model.load_state_dict(checkpoint_filtered, strict=False)
+        else:
+            # Checkpoint has MAS components or model doesn't use MAS - normal loading
+            model.load_state_dict(checkpoint_state_dict, strict=True)
+
     def save_checkpoint(self, update, last=False, epoch=None):
         self.accelerator.wait_for_everyone()
         if self.is_main:
@@ -343,10 +421,8 @@ class TrainerMAS:
                 del checkpoint["ema_model_state_dict"][key]
 
         if self.is_main:
-            # Use strict=False for pretrained models that don't have EMA tracking params (initted, step)
-            # strict = "initted" in checkpoint["ema_model_state_dict"] and "step" in checkpoint["ema_model_state_dict"]
-            # self.ema_model.load_state_dict(checkpoint["ema_model_state_dict"], strict=strict)
-            self.ema_model.load_state_dict(checkpoint["ema_model_state_dict"])
+            # Handle loading V0/V1 checkpoints (no MAS) into MAS-enabled EMA model
+            self._load_state_dict_with_mas_compatibility(self.ema_model, checkpoint["ema_model_state_dict"], is_ema=True)
 
         if "update" in checkpoint or "step" in checkpoint:
             # patch for backward compatibility, with before f992c4e
@@ -361,10 +437,16 @@ class TrainerMAS:
                 if key in checkpoint["model_state_dict"]:
                     del checkpoint["model_state_dict"][key]
 
-            self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint["model_state_dict"])
-            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            if self.scheduler:
+            # Handle loading V0/V1 checkpoints (no MAS) into MAS-enabled models
+            self._load_state_dict_with_mas_compatibility(
+                self.accelerator.unwrap_model(self.model), checkpoint["model_state_dict"]
+            )
+            if "optimizer_state_dict" in checkpoint:
+                self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                print("Loading optimizer from checkpoint")
+            if self.scheduler and "scheduler_state_dict" in checkpoint:
                 self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+                print("Loading scheduler from checkpoint")
             update = checkpoint["update"]
         else:
             checkpoint["model_state_dict"] = {
@@ -372,7 +454,10 @@ class TrainerMAS:
                 for k, v in checkpoint["ema_model_state_dict"].items()
                 if k not in ["initted", "update", "step"]
             }
-            self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint["model_state_dict"])
+            # Handle loading V0/V1 checkpoints (no MAS) into MAS-enabled models
+            self._load_state_dict_with_mas_compatibility(
+                self.accelerator.unwrap_model(self.model), checkpoint["model_state_dict"]
+            )
             update = 0
 
         del checkpoint
@@ -386,6 +471,7 @@ class TrainerMAS:
         test_dataset: Dataset = None,
         eval_first=False,
         resume_from_checkpoint: str = None,
+        restart=False,
         num_workers=16,
         resumable_with_seed: int = None,
     ):
@@ -494,6 +580,8 @@ class TrainerMAS:
             train_dataloader, self.scheduler
         )  # actual multi_gpu updates = single_gpu updates / gpu nums
         start_update = self.load_checkpoint(resume_from_checkpoint)
+        if restart:
+            start_update = 0
         global_update = start_update
 
         if exists(resumable_with_seed):
@@ -586,7 +674,13 @@ class TrainerMAS:
 
                     global_update += 1
                     progress_bar.update(1)
-                    progress_bar.set_postfix(update=str(global_update), loss=loss.item(), batch_size=len(text_inputs))
+                    progress_bar.set_postfix(
+                        update=str(global_update),
+                        loss=loss.item(),
+                        dur_loss=dur_loss.item(),
+                        batch_size=len(text_inputs),
+                        lr=self.scheduler.get_last_lr()[0],
+                    )
 
                 if self.accelerator.is_local_main_process and global_update % self.logging_step == 0:
                     log_dict = {
@@ -594,7 +688,7 @@ class TrainerMAS:
                         "lr": self.scheduler.get_last_lr()[0],
                         "mas_alpha": mas_alpha,
                         "mas_temperature": mas_temperature,
-                        "duration_loss": dur_loss.item() if torch.is_tensor(dur_loss) else dur_loss,
+                        "duration_loss": dur_loss.item(),
                         "total_loss": total_loss.item(),
                         "grad_norm": grad_norm,
                     }

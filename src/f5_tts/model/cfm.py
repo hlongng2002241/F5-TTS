@@ -80,6 +80,8 @@ class CFM(nn.Module):
         # MAS (Monotonic Alignment Search) components
         self.use_mas = use_mas
         if use_mas:
+            assert self.transformer.text_embed.use_mas is True
+
             from f5_tts.model.duration_predictor import DurationPredictor
 
             # Project mel features to text embedding dimension for similarity computation
@@ -88,10 +90,10 @@ class CFM(nn.Module):
 
             # Initialize duration predictor for MAS training
             self.duration_predictor = DurationPredictor(
-                input_dim=text_dim,
-                hidden_dim=256,
-                num_layers=2,
-                dropout=0.1,
+                in_channels=text_dim,
+                filter_channels=256,
+                kernel_size=3,
+                p_dropout=0.1,
             )
         else:
             self.mel_feature_proj = None
@@ -587,7 +589,8 @@ class CFM(nn.Module):
 
         # Duration prediction loss (if duration predictor is available and attn computed)
         dur_loss = torch.tensor(0.0, device=device)
-        if self.duration_predictor is not None and attn is not None and text_embed is not None:
+        if self.use_mas:
+            assert self.duration_predictor is not None
             # Extract ground truth durations from attention
             w = attn.sum(dim=2)  # [b, nt] - number of mel frames per text token
             text_mask = (text != -1).int()  # [b, nt]

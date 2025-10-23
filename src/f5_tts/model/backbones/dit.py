@@ -29,7 +29,9 @@ from f5_tts.model.modules import (
 
 
 class TextEmbedding(nn.Module):
-    def __init__(self, text_num_embeds, text_dim, mask_padding=True, average_upsampling=False, conv_layers=0, conv_mult=2, use_mas=False):
+    def __init__(
+        self, text_num_embeds, text_dim, mask_padding=True, average_upsampling=False, conv_layers=0, conv_mult=2, use_mas=False
+    ):
         super().__init__()
         self.text_embed = nn.Embedding(text_num_embeds + 1, text_dim)  # use 0 as filler token
 
@@ -125,6 +127,7 @@ class TextEmbedding(nn.Module):
         Returns:
             text_embed: [b, n, d] - text embeddings aligned to mel frames
             attn: [b, nt, n] - attention matrix from MAS (None if MAS not used or duration_pred provided)
+            text_embed_raw: [b, nt, d] - raw text embeddings before upsampling
         """
         text = text + 1  # use 0 as filler token. preprocess of batch pad -1, see list_str_to_idx()
         text = text[:, :seq_len]  # curtail if character tokens are more than the mel spec tokens
@@ -173,13 +176,7 @@ class TextEmbedding(nn.Module):
         attn = None
         text_mas = None
 
-        if (
-            self.use_mas
-            and self.similarity_proj is not None
-            and mel_features is not None
-            and self.mas_alpha is not None
-            and self.mas_alpha > 1e-6
-        ):
+        if self.use_mas:
             # Compute similarity between text and mel features
             text_proj = self.similarity_proj(text_embed_raw)  # [b, text_len, d]
             similarity = torch.bmm(text_proj, mel_features.transpose(1, 2))  # [b, text_len, n]
@@ -204,9 +201,10 @@ class TextEmbedding(nn.Module):
 
             # Create masks for valid regions
             text_mask = torch.arange(text_len, device=text_embed_raw.device)[None, :, None] < text_lens[:, None, None]
-            mel_mask = torch.arange(seq_len, device=text_embed_raw.device)[None, None, :] < torch.tensor(
-                [seq_len] * batch, device=text_embed_raw.device
-            )[:, None, None]
+            mel_mask = (
+                torch.arange(seq_len, device=text_embed_raw.device)[None, None, :]
+                < torch.tensor([seq_len] * batch, device=text_embed_raw.device)[:, None, None]
+            )
             attn_mask = text_mask & mel_mask  # [b, nt, n]
 
             # Generate alignment matrix from predicted durations
@@ -225,7 +223,7 @@ class TextEmbedding(nn.Module):
             # Pure V0/V1 path
             text_final = text_v0_v1
 
-        return text_final, attn
+        return text_final, attn, text_embed_raw
 
 
 # noised input audio and context mixing embedding
@@ -289,6 +287,7 @@ class DiT(nn.Module):
         # Text and attention cache for CFG
         self.text_cond, self.text_uncond = None, None
         self.text_cond_attn, self.text_uncond_attn = None, None
+        self.text_cond_raw, self.text_uncond_raw = None, None
         self.input_embed = InputEmbedding(mel_dim, text_dim, dim)
 
         self.rotary_embed = RotaryEmbedding(dim_head)
@@ -361,7 +360,7 @@ class DiT(nn.Module):
             if drop_text:
                 if self.text_uncond is None:
                     # Cache miss - compute and store
-                    self.text_uncond, self.text_uncond_attn = self.text_embed(
+                    self.text_uncond, self.text_uncond_attn, self.text_uncond_raw = self.text_embed(
                         text,
                         seq_len,
                         drop_text=True,
@@ -374,10 +373,11 @@ class DiT(nn.Module):
                 # Cache hit - reuse cached values
                 text_embed = self.text_uncond
                 attn = self.text_uncond_attn
+                text_embed_raw = self.text_uncond_raw
             else:
                 if self.text_cond is None:
                     # Cache miss - compute and store
-                    self.text_cond, self.text_cond_attn = self.text_embed(
+                    self.text_cond, self.text_cond_attn, self.text_cond_raw = self.text_embed(
                         text,
                         seq_len,
                         drop_text=False,
@@ -390,9 +390,10 @@ class DiT(nn.Module):
                 # Cache hit - reuse cached values
                 text_embed = self.text_cond
                 attn = self.text_cond_attn
+                text_embed_raw = self.text_cond_raw
         else:
             # No cache - always compute fresh
-            text_embed, attn = self.text_embed(
+            text_embed, attn, text_embed_raw = self.text_embed(
                 text,
                 seq_len,
                 drop_text=drop_text,
@@ -405,11 +406,12 @@ class DiT(nn.Module):
 
         x = self.input_embed(x, cond, text_embed, drop_audio_cond=drop_audio_cond)
 
-        return x, attn
+        return x, attn, text_embed_raw  # Return raw embeddings for duration predictor
 
     def clear_cache(self):
         self.text_cond, self.text_uncond = None, None
         self.text_cond_attn, self.text_uncond_attn = None, None
+        self.text_cond_raw, self.text_uncond_raw = None, None
 
     def forward(
         self,
@@ -435,9 +437,10 @@ class DiT(nn.Module):
         # t: conditioning time, text: text, x: noised audio + cond audio + text
         t = self.time_embed(time)
         attn = None
+        text_embed_for_return = None  # Track text_embed for returns_text_embed
 
         if cfg_infer:  # pack cond & uncond forward: b n d -> 2b n d
-            x_cond, attn = self.get_input_embed(
+            x_cond, attn, text_embed_cond = self.get_input_embed(
                 x,
                 cond,
                 text,
@@ -450,7 +453,7 @@ class DiT(nn.Module):
                 mel_lens=mel_lens,
                 duration_pred=duration_pred,
             )
-            x_uncond, _ = self.get_input_embed(
+            x_uncond, _, _ = self.get_input_embed(
                 x,
                 cond,
                 text,
@@ -463,11 +466,12 @@ class DiT(nn.Module):
                 mel_lens=mel_lens,
                 duration_pred=duration_pred,
             )
+            text_embed_for_return = text_embed_cond  # Use conditional text embed
             x = torch.cat((x_cond, x_uncond), dim=0)
             t = torch.cat((t, t), dim=0)
             mask = torch.cat((mask, mask), dim=0) if mask is not None else None
         else:
-            x, attn = self.get_input_embed(
+            x, attn, text_embed_for_return = self.get_input_embed(
                 x,
                 cond,
                 text,
@@ -500,8 +504,9 @@ class DiT(nn.Module):
         output = self.proj_out(x)
 
         if returns_text_embed:
-            # For training with duration predictor
-            text_embed = self.text_cond if not drop_text else self.text_uncond
-            return output, text_embed, attn
+            assert text_embed_for_return is not None
+            assert attn is not None
+            # For training with duration predictor - use the text_embed we computed
+            return output, text_embed_for_return, attn
 
         return output

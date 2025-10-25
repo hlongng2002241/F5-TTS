@@ -172,7 +172,14 @@ class DynamicBatchSampler(Sampler[list[int]]):
     """
 
     def __init__(
-        self, sampler: Sampler[int], frames_threshold: int, max_samples=0, random_seed=None, drop_residual: bool = False, num_replicas: int = 1, rank: int = 0
+        self,
+        sampler: Sampler[int],
+        frames_threshold: int,
+        max_samples=0,
+        random_seed=None,
+        drop_residual: bool = False,
+        num_replicas: int = 1,
+        rank: int = 0,
     ):
         self.sampler = sampler
         self.frames_threshold = frames_threshold
@@ -238,14 +245,18 @@ class DynamicBatchSampler(Sampler[list[int]]):
         if self.num_replicas > 1:
             # Each GPU gets every num_replicas-th batch starting from its rank
             # Example with 2 GPUs: GPU0 gets batches [0,2,4,...], GPU1 gets batches [1,3,5,...]
-            batches = batches[self.rank::self.num_replicas]
+            N = int(len(batches) / self.num_replicas) * self.num_replicas
+            batches = batches[self.rank : N : self.num_replicas]
 
         return iter(batches)
 
     def __len__(self):
         # Return number of batches this GPU will process
+        # Must match the actual number yielded by __iter__()
         if self.num_replicas > 1:
-            return len(self.batches) // self.num_replicas + (1 if self.rank < len(self.batches) % self.num_replicas else 0)
+            # __iter__() truncates to N = (len // num_replicas) * num_replicas
+            # So each GPU gets exactly len // num_replicas batches (no remainder)
+            return len(self.batches) // self.num_replicas
         return len(self.batches)
 
 

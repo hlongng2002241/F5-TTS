@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import math
 import os
+import logging
 
 import torch
 import torchaudio
@@ -18,6 +19,9 @@ from tqdm import tqdm
 from f5_tts.model import CFM
 from f5_tts.model.dataset import DynamicBatchSampler, collate_fn
 from f5_tts.model.utils import default, exists
+
+
+_logger = logging.getLogger(__name__)
 
 
 # trainer
@@ -40,6 +44,7 @@ class TrainerMAS:
         max_grad_norm=1.0,
         noise_scheduler: str | None = None,
         duration_predictor: torch.nn.Module | None = None,
+        verbose=False,
         logger: str | None = "wandb",  # "wandb" | "tensorboard" | None
         logging_step: int = 10,
         wandb_project="test_f5-tts",
@@ -74,6 +79,16 @@ class TrainerMAS:
             gradient_accumulation_steps=grad_accumulation_steps,
             **accelerate_kwargs,
         )
+
+        self.verbose = verbose
+        if self.verbose:
+            assert checkpoint_path is not None
+            from quick_utils.common.logger import setup_logger
+
+            root_logger = logging.getLogger()
+            root_logger.handlers.clear()
+
+            setup_logger(file=os.path.join(checkpoint_path, "train.log"), stdout=False)
 
         self.logger = logger
         self.logging_step = logging_step
@@ -211,14 +226,15 @@ class TrainerMAS:
                 mel_lengths = batch["mel_lengths"]
 
                 # Handle different return formats (standard vs MAS)
+                # During evaluation, we still need to compute MAS loss for duration predictor
                 model_output = self.model(
                     mel_spec,
                     text=text_inputs,
                     lens=mel_lengths,
                     noise_scheduler=self.noise_scheduler,
-                    returns_text_tokens=False,  # Don't need text tokens during evaluation
                 )
-                loss, cond, pred = model_output[:3]  # Only take first 3 values
+                # For MAS training, output is (loss, cond, pred, text_embed, attn, dur_loss)
+                loss = model_output[0]
 
                 total_loss += loss.item()
                 num_batches += 1
@@ -231,8 +247,10 @@ class TrainerMAS:
         avg_loss_tensor = torch.tensor(avg_loss, device=self.accelerator.device)
         avg_loss_tensor = self.accelerator.gather(avg_loss_tensor).mean()
 
+        # All processes get the gathered average
+        avg_loss = avg_loss_tensor.item()
+
         if self.accelerator.is_local_main_process:
-            avg_loss = avg_loss_tensor.item()
             print(f"\nTest Loss: {avg_loss:.4f}")
 
             # Log to wandb/tensorboard
@@ -241,9 +259,13 @@ class TrainerMAS:
                 self.writer.add_scalar("test_loss", avg_loss, global_update)
 
         self.model.train()
+
+        # Clear CUDA cache to prevent memory accumulation
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         # Ensure all processes finish evaluation before continuing
         self.accelerator.wait_for_everyone()
-        print(dict(test_loss=avg_loss))
 
         return avg_loss
 
@@ -321,12 +343,16 @@ class TrainerMAS:
 
             # Load with strict=False (only because of MAS keys)
             model.load_state_dict(checkpoint_filtered, strict=False)
+
         else:
             # Checkpoint has MAS components or model doesn't use MAS - normal loading
             model.load_state_dict(checkpoint_state_dict, strict=True)
 
     def save_checkpoint(self, update, last=False, epoch=None):
+        self.log(f"save_checkpoint called, waiting for everyone...", flush=True)
         self.accelerator.wait_for_everyone()
+        self.log(f"wait_for_everyone completed in save_checkpoint", flush=True)
+
         if self.is_main:
             checkpoint = dict(
                 model_state_dict=self.accelerator.unwrap_model(self.model).state_dict(),
@@ -344,7 +370,7 @@ class TrainerMAS:
                 # Save epoch checkpoint
                 if self.keep_last_n_checkpoints == 0:
                     return
-                self.accelerator.save(checkpoint, f"{self.checkpoint_path}/model_epoch{epoch}_update{update}.pt")
+                self.accelerator.save(checkpoint, f"{self.checkpoint_path}/model_epoch={epoch}_update={update}.pt")
                 print(f"Saved epoch {epoch} checkpoint at update {update}")
             else:
                 if self.keep_last_n_checkpoints == 0:
@@ -365,6 +391,11 @@ class TrainerMAS:
                         oldest_checkpoint = checkpoints.pop(0)
                         os.remove(os.path.join(self.checkpoint_path, oldest_checkpoint))
                         print(f"Removed old checkpoint: {oldest_checkpoint}")
+
+        # Ensure all processes finish checkpoint saving before continuing
+        self.log(f"save_checkpoint done, final wait_for_everyone...", flush=True)
+        self.accelerator.wait_for_everyone()
+        self.log(f"save_checkpoint completely finished", flush=True)
 
     def load_checkpoint(self, resume_from_checkpoint: str = None) -> int:
         latest_checkpoint = None
@@ -414,6 +445,8 @@ class TrainerMAS:
         elif latest_checkpoint.endswith(".pt"):
             # checkpoint = torch.load(f"{self.checkpoint_path}/{latest_checkpoint}", map_location=self.accelerator.device)  # rather use accelerator.load_state ಥ_ಥ
             checkpoint = torch.load(latest_checkpoint, weights_only=True, map_location="cpu")
+        else:
+            raise NotImplementedError(latest_checkpoint)
 
         # patch for backward compatibility, 305e3ea
         for key in ["ema_model.mel_spec.mel_stft.mel_scale.fb", "ema_model.mel_spec.mel_stft.spectrogram.window"]:
@@ -448,6 +481,7 @@ class TrainerMAS:
                 self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
                 print("Loading scheduler from checkpoint")
             update = checkpoint["update"]
+
         else:
             checkpoint["model_state_dict"] = {
                 k.replace("ema_model.", ""): v
@@ -621,7 +655,10 @@ class TrainerMAS:
                 position=1,
             )
 
-            for batch in current_dataloader:
+            for batch_idx, batch in enumerate(current_dataloader):
+                if batch_idx % 10 == 0:
+                    self.log(f"Batch {batch_idx}, Update {global_update}", flush=True)
+
                 with self.accelerator.accumulate(self.model):
                     text_inputs = batch["text"]
                     mel_spec = batch["mel"].permute(0, 2, 1)
@@ -707,10 +744,14 @@ class TrainerMAS:
                         self.writer.add_scalar("grad_norm", grad_norm, global_update)
 
                 if global_update % self.last_per_updates == 0 and self.accelerator.sync_gradients:
+                    self.log(f"Saving last checkpoint at update {global_update}", flush=True)
                     self.save_checkpoint(global_update, last=True)
+                    self.log(f"Finished saving last checkpoint", flush=True)
 
                 if global_update % self.save_per_updates == 0 and self.accelerator.sync_gradients:
+                    self.log(f"Saving checkpoint at update {global_update}", flush=True)
                     self.save_checkpoint(global_update)
+                    self.log(f"Finished saving checkpoint", flush=True)
 
                     # Evaluate after saving checkpoint
                     if test_dataloader is not None:
@@ -743,11 +784,28 @@ class TrainerMAS:
                         self.model.train()
 
             # Save checkpoint and evaluate at the end of each epoch
+            # Note: Don't add wait_for_everyone() here with even_batches=False
+            # as GPUs may have different batch counts and will deadlock
+            self.log(f"Exited training loop for epoch {epoch}, update {global_update}", flush=True)
             progress_bar.close()
+
+            self.log(f"Epoch {epoch} completed. About to save checkpoint...", flush=True)
+
             self.save_checkpoint(global_update, epoch=epoch)
+            self.log(f"Finished saving epoch checkpoint", flush=True)
+
             if test_dataloader is not None:
+                if self.accelerator.is_local_main_process:
+                    print(f"\n{'='*60}")
+                    print(f"Running evaluation...")
+                    print(f"{'='*60}")
                 self.evaluate(test_dataloader, global_update)
 
         self.save_checkpoint(global_update, last=True)
 
         self.accelerator.end_training()
+
+    def log(self, *value, end="\n", sep=" ", flush=False, file=None):
+        if self.verbose:
+            # print(f"[GPU {self.accelerator.process_index}]", *value, end=end, sep=sep, flush=flush, file=file)
+            _logger.info(sep.join([f"[GPU {self.accelerator.process_index}]"] + [str(v) for v in value]))

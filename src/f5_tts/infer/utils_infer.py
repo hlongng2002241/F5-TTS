@@ -240,9 +240,12 @@ def load_model(
         vocab_file = str(files("f5_tts").joinpath("infer/examples/vocab.txt"))
     tokenizer = "custom"
 
-    print("\nvocab : ", vocab_file)
-    print("token : ", tokenizer)
-    print("model : ", ckpt_path, "\n")
+    use_mas = getattr(model_cfg, "use_mas", False)
+    
+    print("\nvocab   : ", vocab_file)
+    print("token   : ", tokenizer)
+    print("model   : ", ckpt_path)
+    print("use_mas : ", use_mas, "\n")
 
     vocab_char_map, vocab_size = get_tokenizer(vocab_file, tokenizer)
     model = CFM(
@@ -259,10 +262,15 @@ def load_model(
             method=ode_method,
         ),
         vocab_char_map=vocab_char_map,
+        use_mas=use_mas,
     ).to(device)
 
     dtype = torch.float32 if mel_spec_type == "bigvgan" else None
+    dtype = torch.float32 if use_mas else dtype
     model = load_checkpoint(model, ckpt_path, device, dtype=dtype, use_ema=use_ema)
+
+    # model.use_mas = False
+    # model.transformer.text_embed.use_mas = False
 
     return model
 

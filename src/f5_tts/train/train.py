@@ -7,9 +7,9 @@ import hydra
 from omegaconf import OmegaConf
 
 from f5_tts.model import CFM, Trainer
-from f5_tts.model.trainer_mas import TrainerMAS
-from f5_tts.model.dataset import load_dataset, load_jsonl_dataset
+from f5_tts.model.dataset import load_dataset, load_dataset_v2
 from f5_tts.model.utils import get_tokenizer
+from f5_tts.model.duration_predictor import DurationPredictor
 
 
 os.chdir(str(files("f5_tts").joinpath("../..")))  # change working directory to root of project (local editable)
@@ -33,28 +33,21 @@ def main(model_cfg):
     vocab_char_map, vocab_size = get_tokenizer(tokenizer_path, tokenizer)
 
     # set model
-    use_mas = model_cfg.model.arch.get("use_mas", False)
+    # duration_predictor = DurationPredictor(
+    #     text_num_embeds=vocab_size,
+    #     in_channels=512,
+    #     filter_channels=32,
+    #     kernel_size=3,
+    #     p_dropout=0.1,
+    # )
+    duration_predictor = None
 
     model = CFM(
         transformer=model_cls(**model_arc, text_num_embeds=vocab_size, mel_dim=model_cfg.model.mel_spec.n_mel_channels),
         mel_spec_kwargs=model_cfg.model.mel_spec,
         vocab_char_map=vocab_char_map,
-        use_mas=use_mas,
+        duration_predictor=duration_predictor
     )
-
-    # Print MAS components if enabled
-    if use_mas:
-        print("\n" + "=" * 60)
-        print("MAS Training Mode Enabled")
-        print("=" * 60)
-        print(f"MAS components automatically initialized:")
-        print(f"  - similarity_proj: {model.transformer.text_embed.similarity_proj}")
-        print(f"  - duration_predictor: {model.duration_predictor}")
-        print(f"  - mel_feature_proj: {model.mel_feature_proj}")
-        print("=" * 60 + "\n")
-
-    # Select trainer class based on use_mas
-    trainer_cls = TrainerMAS if use_mas else Trainer
 
     # Common trainer arguments
     trainer_args = dict(
@@ -82,28 +75,14 @@ def main(model_cfg):
         is_local_vocoder=model_cfg.model.vocoder.is_local,
         local_vocoder_path=model_cfg.model.vocoder.local_path,
         model_cfg_dict=OmegaConf.to_container(model_cfg, resolve=True),
-        verbose=False,
     )
 
-    # Add MAS-specific arguments if using MAS
-    if use_mas:
-        mas_config = model_cfg.get("mas", {})
-        trainer_args.update(
-            duration_predictor=model.duration_predictor,  # Use auto-initialized duration predictor
-            use_mas=True,
-            mas_warmup_steps_alpha=mas_config.get("warmup_steps_alpha", 150000),
-            mas_warmup_steps_temperature=mas_config.get("warmup_steps_temperature", 100000),
-            duration_loss_weight=mas_config.get("duration_loss_weight", 0.1),
-            lr_mas_components=mas_config.get("lr_mas_components", 1e-4),
-            lr_v0v1_components=mas_config.get("lr_v0v1_components", 1e-5),
-        )
-
     # Initialize trainer
-    trainer = trainer_cls(**trainer_args)
+    trainer = Trainer(**trainer_args)
 
     # train_dataset = load_dataset(model_cfg.datasets.name, tokenizer, mel_spec_kwargs=model_cfg.model.mel_spec)
-    train_dataset = load_jsonl_dataset(model_cfg.datasets.train_path)
-    test_dataset = load_jsonl_dataset(model_cfg.datasets.test_path)
+    train_dataset = load_dataset_v2(model_cfg.datasets.train_path)
+    test_dataset = load_dataset_v2(model_cfg.datasets.test_path)
     trainer.train(
         train_dataset,
         test_dataset,

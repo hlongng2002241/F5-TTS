@@ -6,6 +6,7 @@ nt - text sequence
 nw - raw wave length
 d - dimension
 """
+
 # ruff: noqa: F722 F821
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from torch.nn.utils.rnn import pad_sequence
 from torchdiffeq import odeint
 
 from f5_tts.model.modules import MelSpec
+from f5_tts.model.duration_predictor import DurationPredictor
 from f5_tts.model.utils import (
     default,
     exists,
@@ -48,6 +50,7 @@ class CFM(nn.Module):
         mel_spec_kwargs: dict = dict(),
         frac_lengths_mask: tuple[float, float] = (0.7, 1.0),
         vocab_char_map: dict[str:int] | None = None,
+        duration_predictor: DurationPredictor = None,
     ):
         super().__init__()
 
@@ -75,6 +78,8 @@ class CFM(nn.Module):
 
         # vocab map for tokenization
         self.vocab_char_map = vocab_char_map
+
+        self.duration_predictor = duration_predictor
 
     @property
     def device(self):
@@ -148,7 +153,7 @@ class CFM(nn.Module):
 
         if no_ref_audio:
             cond = torch.zeros_like(cond)
-        
+
         step_cond = torch.where(
             cond_mask, cond, torch.zeros_like(cond)
         )  # allow direct control (cut cond audio) with lens passed in
@@ -262,7 +267,7 @@ class CFM(nn.Module):
             cond = self.mel_spec(cond)
             cond = cond.permute(0, 2, 1)
             assert cond.shape[-1] == self.num_channels
-            
+
         cond = cond.to(next(self.parameters()).dtype)
 
         batch, cond_seq_len, device = *cond.shape[:2], cond.device
@@ -279,7 +284,7 @@ class CFM(nn.Module):
             assert text.shape[0] == batch
 
         # duration
-        
+
         cond_mask = lens_to_mask(lens)
         if edit_mask is not None:
             cond_mask = cond_mask & edit_mask
@@ -292,28 +297,28 @@ class CFM(nn.Module):
         )  # duration at least text/audio prompt length plus one token, so something is generated
         duration = duration.clamp(max=max_duration)
         max_duration = duration.amax()
-        
+
         # duplicate test corner for inner time step oberservation
         if duplicate_test:
             test_cond = F.pad(cond, (0, 0, cond_seq_len, max_duration - 2 * cond_seq_len), value=0.0)
 
-        # add cond audio to right, => sample left 
+        # add cond audio to right, => sample left
         tmp_cond = torch.zeros((cond.shape[0], max_duration, cond.shape[2]), dtype=cond.dtype, device=cond.device)
         cond_mask = torch.zeros((cond.shape[0], max_duration, 1), dtype=torch.bool, device=cond.device)
         for index, dur in enumerate(duration):
             end = dur - (cond.shape[1] - lens[index])
             start = end - lens[index]
-            tmp_cond[index, start : end] = cond[index]
-            cond_mask[index, start : end] = True
+            tmp_cond[index, start:end] = cond[index]
+            cond_mask[index, start:end] = True
         cond = tmp_cond
-        
+
         if no_ref_audio:
             cond = torch.zeros_like(cond)
 
         step_cond = torch.where(
             cond_mask, cond, torch.zeros_like(cond)
         )  # allow direct control (cut cond audio) with lens passed in
-        
+
         if batch > 1:
             mask = lens_to_mask(duration)
         else:  # save memory and speed up, as single inference need no mask currently
@@ -403,6 +408,7 @@ class CFM(nn.Module):
         *,
         lens: int["b"] | None = None,
         noise_scheduler: str | None = None,
+        mel_attn=None,
     ):
         # handle raw wave
         if inp.ndim == 2:
@@ -419,6 +425,8 @@ class CFM(nn.Module):
             else:
                 text = list_str_to_tensor(text).to(device)
             assert text.shape[0] == batch
+
+        text_mask = (text != -1).int()
 
         # lens and mask
         if not exists(lens):  # if lens not acquired by trainer from collate_fn
@@ -460,11 +468,28 @@ class CFM(nn.Module):
 
         # apply mask will use more memory; might adjust batchsize or batchsampler long sequence threshold
         pred = self.transformer(
-            x=φ, cond=cond, text=text, time=time, drop_audio_cond=drop_audio_cond, drop_text=drop_text, mask=mask
+            x=φ,
+            cond=cond,
+            text=text,
+            time=time,
+            drop_audio_cond=drop_audio_cond,
+            drop_text=drop_text,
+            mask=mask,
+            mel_attn=mel_attn,
         )
 
         # flow matching loss
         loss = F.mse_loss(pred, flow, reduction="none")
-        loss = loss[rand_span_mask]
+        loss = loss[rand_span_mask].mean()
 
-        return loss.mean(), cond, pred
+        if self.duration_predictor is not None:
+            assert mel_attn is not None  # [b, L_text, L_mel]
+            w = mel_attn.sum(dim=2)
+            logw_ = torch.log(w + 1e-6) * text_mask
+            logw = self.duration_predictor(text, text_mask)
+            dur_loss = torch.sum((logw - logw_) ** 2 * text_mask) / torch.sum(text_mask)
+
+        else:
+            dur_loss =  torch.tensor(0.0).to(device=loss.device)
+
+        return loss, dur_loss, cond, pred

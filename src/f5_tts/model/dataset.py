@@ -5,6 +5,7 @@ from importlib.resources import files
 import torch
 import torch.nn.functional as F
 import torchaudio
+import numpy as np
 from datasets import Dataset as Dataset_
 from datasets import load_from_disk
 from torch import nn
@@ -155,10 +156,24 @@ class CustomDataset(Dataset):
             mel_spec = self.mel_spectrogram(audio)
             mel_spec = mel_spec.squeeze(0)  # '1 d t -> d t'
 
-        return {
+        ret = {
             "mel_spec": mel_spec,
             "text": text,
         }
+
+        if "mel_alignments" in row:
+            mel_length = int(row["duration"] * self.target_sample_rate / self.hop_length)
+            mel_attn = prepare_attn(row["mel_alignments"], mel_length)
+            ret["mel_attn"] = mel_attn
+
+        return ret
+
+
+def prepare_attn(mel_alignments: list, mel_length: int):
+    attn = torch.zeros((len(mel_alignments), mel_length)).float()
+    for i_text, (s, e) in enumerate(mel_alignments):
+        attn[i_text, s:e] = 1.0
+    return attn
 
 
 # Dynamic Batch Sampler
@@ -321,12 +336,20 @@ def load_dataset(
             load_dataset(f"{pre}/{pre}", split=f"train.{post}", cache_dir=str(files("f5_tts").joinpath("../../data"))),
         )
 
+    else:
+        raise NotImplementedError(dataset_type)
+
     return train_dataset
 
 
-def load_jsonl_dataset(path: str):
-    with jsonlines.open(path) as f:
-        dataset = list(f)
+def load_dataset_v2(path: str):
+    if path.endswith(".jsonl"):
+        with jsonlines.open(path) as f:
+            dataset = list(tqdm(f))
+    else:
+        from quick_utils.common.indexed_dataset import IndexedDataset
+
+        dataset = IndexedDataset(path, num_cache=32)
     return CustomDataset(dataset)
 
 
@@ -334,6 +357,7 @@ def load_jsonl_dataset(path: str):
 
 
 def collate_fn(batch):
+    first = batch[0]
     mel_specs = [item["mel_spec"].squeeze(0) for item in batch]
     mel_lengths = torch.LongTensor([spec.shape[-1] for spec in mel_specs])
     max_mel_length = mel_lengths.amax()
@@ -348,10 +372,26 @@ def collate_fn(batch):
 
     text = [item["text"] for item in batch]
     text_lengths = torch.LongTensor([len(item) for item in text])
+    max_text_length = text_lengths.amax()
 
-    return dict(
+    ret = dict(
         mel=mel_specs,
         mel_lengths=mel_lengths,  # records for padding mask
         text=text,
         text_lengths=text_lengths,
     )
+
+    if "mel_attn" in first:
+        attn_matrices = [item["mel_attn"] for item in batch]
+        padded_attn_matrices = []
+        for attn in attn_matrices:
+            attn = torch.tensor(np.array(attn))
+            attn_height, attn_width = attn.shape
+            pad_height = max(0, max_text_length - attn_height)
+            pad_width = max(0, max_mel_length - attn_width)
+            padded_attn = F.pad(attn, (0, pad_width, 0, pad_height), value=0)
+            padded_attn_matrices.append(padded_attn)
+        attn = torch.stack(padded_attn_matrices)
+        ret["mel_attn"] = attn
+
+    return ret

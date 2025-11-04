@@ -1,96 +1,47 @@
-"""
-Duration Predictor for predicting mel frame durations from text embeddings.
-
-This module predicts log-duration (number of mel frames) for each text token
-based on learned features. It's trained using ground-truth durations extracted
-from MAS alignments.
-"""
-
-import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
-from f5_tts.model.modules import LayerNorm
+import f5_tts.model.modules as modules
+import torch
 
 
 class DurationPredictor(nn.Module):
-    """
-    Predicts log-duration for each text token.
-
-    Architecture:
-        text_embed → Conv1d → ReLU → LayerNorm → Dropout →
-        Conv1d → ReLU → LayerNorm → Dropout → Conv1d(out=1) → log_duration
-    """
-
-    def __init__(
-        self,
-        in_channels=512,      # text embedding dimension
-        filter_channels=256,  # hidden dimension
-        kernel_size=3,        # convolution kernel size
-        p_dropout=0.5,        # dropout probability
-    ):
+    def __init__(self, text_num_embeds, in_channels, filter_channels, kernel_size, p_dropout, gin_channels=0):
         super().__init__()
+
+        text_dim = in_channels
+        self.text_embed = nn.Embedding(text_num_embeds + 1, text_dim)  # use 0 as filler token
 
         self.in_channels = in_channels
         self.filter_channels = filter_channels
         self.kernel_size = kernel_size
         self.p_dropout = p_dropout
+        self.gin_channels = gin_channels
 
-        # Layer 1: in_channels → filter_channels
-        self.conv_1 = nn.Conv1d(
-            in_channels, filter_channels, kernel_size, padding=kernel_size // 2
-        )
-        self.norm_1 = LayerNorm(filter_channels)
-        self.drop_1 = nn.Dropout(p_dropout)
-
-        # Layer 2: filter_channels → filter_channels
-        self.conv_2 = nn.Conv1d(
-            filter_channels, filter_channels, kernel_size, padding=kernel_size // 2
-        )
-        self.norm_2 = LayerNorm(filter_channels)
-        self.drop_2 = nn.Dropout(p_dropout)
-
-        # Projection: filter_channels → 1 (log duration)
+        self.drop = nn.Dropout(p_dropout)
+        self.conv_1 = nn.Conv1d(in_channels, filter_channels, kernel_size, padding=kernel_size // 2)
+        self.norm_1 = modules.LayerNorm(filter_channels)
+        self.conv_2 = nn.Conv1d(filter_channels, filter_channels, kernel_size, padding=kernel_size // 2)
+        self.norm_2 = modules.LayerNorm(filter_channels)
         self.proj = nn.Conv1d(filter_channels, 1, 1)
 
-    def forward(
-        self,
-        x: torch.Tensor,     # [b, nt, d] - text embeddings
-        x_mask: torch.Tensor # [b, nt] - text mask (1 for valid, 0 for padding)
-    ) -> torch.Tensor:
-        """
-        Predict log-duration for each text token.
+        if gin_channels != 0:
+            self.cond = nn.Conv1d(gin_channels, in_channels, 1)
 
-        Args:
-            x: [b, nt, d] - text embeddings from transformer
-            x_mask: [b, nt] - binary mask (1 for valid tokens, 0 for padding)
-
-        Returns:
-            log_duration: [b, nt, 1] - predicted log-duration for each token
-        """
-        # Transpose to [b, d, nt] for Conv1d
-        x = x.transpose(1, 2)  # [b, d, nt]
-        x_mask = x_mask.unsqueeze(1)  # [b, 1, nt]
-
-        # Layer 1
+    def forward(self, x, x_mask, g=None):
+        x = x + 1  # use 0 as filler token. preprocess of batch pad -1, see list_str_to_idx()
+        x = self.text_embed(x).transpose(1, 2)  # [b dim nt]
+        # x = x.transpose(1,2) # [b dim nt]
+        x_mask = x_mask.unsqueeze(2).transpose(1, 2)  # [b 1 nt]
+        # x = torch.detach(x)
+        if g is not None:
+            g = torch.detach(g)
+            x = x + self.cond(g)
         x = self.conv_1(x * x_mask)
-        x = F.relu(x)
+        x = torch.relu(x)
         x = self.norm_1(x)
-        x = self.drop_1(x)
-
-        # Layer 2
+        x = self.drop(x)
         x = self.conv_2(x * x_mask)
-        x = F.relu(x)
+        x = torch.relu(x)
         x = self.norm_2(x)
-        x = self.drop_2(x)
-
-        # Project to log-duration
+        x = self.drop(x)
         x = self.proj(x * x_mask)
-
-        # Transpose back to [b, nt, 1]
-        x = x.transpose(1, 2)
-
-        # Mask padding tokens
-        x = x * x_mask.transpose(1, 2)
-
-        return x
+        return x * x_mask

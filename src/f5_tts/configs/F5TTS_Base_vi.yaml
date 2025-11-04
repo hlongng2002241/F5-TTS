@@ -20,6 +20,7 @@ optim:
   max_grad_norm: 1.0  # gradient clipping
   bnb_optimizer: False  # use bnb 8bit AdamW optimizer or not
   eval_first: False
+  restart: False
 
 model:
   name: F5TTS_Base  # model name
@@ -32,12 +33,12 @@ model:
     heads: 16
     ff_mult: 2
     text_dim: 512
-    text_mask_padding: False
+    text_mask_padding: False # True for trying for batch inference
     conv_layers: 4
     pe_attn_head: 1
     attn_backend: torch  # torch | flash_attn
     attn_mask_enabled: False
-    checkpoint_activations: False  # recompute activations and save memory for extra compute
+    checkpoint_activations: True  # recompute activations and save memory for extra compute
   mel_spec:
     target_sample_rate: 24000
     n_mel_channels: 100

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import gc
-import math
 import os
+import math
+from collections import OrderedDict
 
 import torch
 import torchaudio
@@ -149,7 +150,10 @@ class Trainer:
         """Evaluate model on test dataset."""
         self.model.eval()
         total_loss = 0
+        total_dur_loss = 0
         num_batches = 0
+
+        print("Start evaluation")
 
         pbar = tqdm(
             test_dataloader,
@@ -162,33 +166,43 @@ class Trainer:
                 text_inputs = batch["text"]
                 mel_spec = batch["mel"].permute(0, 2, 1)
                 mel_lengths = batch["mel_lengths"]
+                mel_attn = batch.get("mel_attn")
 
-                loss, cond, pred = self.model(mel_spec, text=text_inputs, lens=mel_lengths, noise_scheduler=self.noise_scheduler)
+                loss, dur_loss, cond, pred = self.model(
+                    mel_spec, text=text_inputs, lens=mel_lengths, noise_scheduler=self.noise_scheduler, mel_attn=mel_attn
+                )
 
                 total_loss += loss.item()
+                total_dur_loss += dur_loss.item()
                 num_batches += 1
 
                 pbar.set_postfix(batch_size=len(text_inputs))
 
         avg_loss = total_loss / num_batches if num_batches > 0 else 0
+        avg_dur_loss = total_dur_loss / num_batches if num_batches > 0 else 0
 
         # Gather losses from all processes
         avg_loss_tensor = torch.tensor(avg_loss, device=self.accelerator.device)
         avg_loss_tensor = self.accelerator.gather(avg_loss_tensor).mean()
 
+        avg_dur_loss_tensor = torch.tensor(avg_dur_loss, device=self.accelerator.device)
+        avg_dur_loss_tensor = self.accelerator.gather(avg_dur_loss_tensor).mean()
+
         if self.accelerator.is_local_main_process:
             avg_loss = avg_loss_tensor.item()
-            print(f"\nTest Loss: {avg_loss:.4f}")
+            avg_dur_loss = avg_dur_loss_tensor.item()
+            print(f"\nTest Loss: {avg_loss:.4f} | Test Duration Loss: {avg_dur_loss:.4f}")
 
             # Log to wandb/tensorboard
             self.accelerator.log({"test_loss": avg_loss}, step=global_update)
+            self.accelerator.log({"test_dur_loss": avg_dur_loss}, step=global_update)
             if self.logger == "tensorboard":
                 self.writer.add_scalar("test_loss", avg_loss, global_update)
+                self.writer.add_scalar("test_dur_loss", avg_dur_loss, global_update)
 
         self.model.train()
         # Ensure all processes finish evaluation before continuing
         self.accelerator.wait_for_everyone()
-        print(dict(test_loss=avg_loss))
 
         return avg_loss
 
@@ -281,6 +295,8 @@ class Trainer:
         elif latest_checkpoint.endswith(".pt"):
             # checkpoint = torch.load(f"{self.checkpoint_path}/{latest_checkpoint}", map_location=self.accelerator.device)  # rather use accelerator.load_state ಥ_ಥ
             checkpoint = torch.load(latest_checkpoint, weights_only=True, map_location="cpu")
+        else:
+            raise NotImplementedError(latest_checkpoint)
 
         # patch for backward compatibility, 305e3ea
         for key in ["ema_model.mel_spec.mel_stft.mel_scale.fb", "ema_model.mel_spec.mel_stft.spectrogram.window"]:
@@ -307,10 +323,12 @@ class Trainer:
                     del checkpoint["model_state_dict"][key]
 
             self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint["model_state_dict"])
-            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            if self.scheduler:
+            if "optimizer_state_dict" in checkpoint:
+                self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            if self.scheduler and "scheduler_state_dict" in checkpoint:
                 self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
             update = checkpoint["update"]
+
         else:
             checkpoint["model_state_dict"] = {
                 k.replace("ema_model.", ""): v
@@ -333,7 +351,9 @@ class Trainer:
         resume_from_checkpoint: str = None,
         num_workers=16,
         resumable_with_seed: int = None,
+        restart=False,
     ):
+        vocoder = None
         if self.log_samples:
             from f5_tts.infer.utils_infer import cfg_strength, load_vocoder, nfe_step, sway_sampling_coef
 
@@ -344,8 +364,8 @@ class Trainer:
                 device="cpu",
             )
             target_sample_rate = self.accelerator.unwrap_model(self.model).mel_spec.target_sample_rate
-            log_samples_path = f"{self.checkpoint_path}/samples"
-            os.makedirs(log_samples_path, exist_ok=True)
+            self.log_samples_path = f"{self.checkpoint_path}/samples"
+            os.makedirs(self.log_samples_path, exist_ok=True)
 
         if exists(resumable_with_seed):
             generator = torch.Generator()
@@ -384,6 +404,7 @@ class Trainer:
                 pin_memory=True,
                 persistent_workers=True,
                 batch_sampler=batch_sampler,
+                prefetch_factor=2,
             )
         else:
             raise ValueError(f"batch_size_type must be either 'sample' or 'frame', but received {self.batch_size_type}")
@@ -439,6 +460,8 @@ class Trainer:
             train_dataloader, self.scheduler
         )  # actual multi_gpu updates = single_gpu updates / gpu nums
         start_update = self.load_checkpoint(resume_from_checkpoint)
+        if restart:
+            start_update = 0
         global_update = start_update
 
         if exists(resumable_with_seed):
@@ -483,19 +506,22 @@ class Trainer:
                     text_inputs = batch["text"]
                     mel_spec = batch["mel"].permute(0, 2, 1)
                     mel_lengths = batch["mel_lengths"]
+                    mel_attn = batch.get("mel_attn")
 
                     # TODO. add duration predictor training
-                    if self.duration_predictor is not None and self.accelerator.is_local_main_process:
-                        dur_loss = self.duration_predictor(mel_spec, lens=batch.get("durations"))
-                        self.accelerator.log({"duration loss": dur_loss.item()}, step=global_update)
+                    # if self.duration_predictor is not None and self.accelerator.is_local_main_process:
+                    #     dur_loss = self.duration_predictor(mel_spec, lens=batch.get("durations"))
+                    #     self.accelerator.log({"duration loss": dur_loss.item()}, step=global_update)
 
-                    loss, cond, pred = self.model(
-                        mel_spec, text=text_inputs, lens=mel_lengths, noise_scheduler=self.noise_scheduler
+                    loss, dur_loss, cond, pred = self.model(
+                        mel_spec, text=text_inputs, lens=mel_lengths, noise_scheduler=self.noise_scheduler, mel_attn=mel_attn
                     )
-                    self.accelerator.backward(loss)
+                    self.accelerator.backward(loss + dur_loss * 0.1)
 
+                    # Track gradient norm
+                    grad_norm = None
                     if self.max_grad_norm > 0 and self.accelerator.sync_gradients:
-                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                        grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
                     self.optimizer.step()
                     self.scheduler.step()
@@ -507,13 +533,25 @@ class Trainer:
 
                     global_update += 1
                     progress_bar.update(1)
-                    progress_bar.set_postfix(update=str(global_update), loss=loss.item(), batch_size=len(text_inputs))
+                    progress_bar.set_postfix(
+                        OrderedDict(
+                            update=str(global_update),
+                            batch_size=len(text_inputs),
+                            loss=loss.item(),
+                            dur_loss=dur_loss.item(),
+                        )
+                    )
 
                 if self.accelerator.is_local_main_process and global_update % self.logging_step == 0:
-                    self.accelerator.log({"loss": loss.item(), "lr": self.scheduler.get_last_lr()[0]}, step=global_update)
+                    log_dict = {"loss": loss.item(), "dur_loss": dur_loss.item(), "lr": self.scheduler.get_last_lr()[0]}
+                    if grad_norm is not None:
+                        log_dict["grad_norm"] = grad_norm.item()
+
+                    self.accelerator.log(log_dict, step=global_update)
+
                     if self.logger == "tensorboard":
-                        self.writer.add_scalar("loss", loss.item(), global_update)
-                        self.writer.add_scalar("lr", self.scheduler.get_last_lr()[0], global_update)
+                        for k, v in log_dict.items():
+                            self.writer.add_scalar(k, v, global_update)
 
                 if global_update % self.last_per_updates == 0 and self.accelerator.sync_gradients:
                     self.save_checkpoint(global_update, last=True)
@@ -526,6 +564,8 @@ class Trainer:
                         self.evaluate(test_dataloader, global_update)
 
                     if self.log_samples and self.accelerator.is_local_main_process:
+                        assert vocoder is not None
+                        
                         ref_audio_len = mel_lengths[0]
                         infer_text = [text_inputs[0] + ([" "] if isinstance(text_inputs[0], list) else " ") + text_inputs[0]]
                         with torch.inference_mode():
@@ -546,9 +586,11 @@ class Trainer:
                             elif self.vocoder_name == "bigvgan":
                                 gen_audio = vocoder(gen_mel_spec).squeeze(0)
                                 ref_audio = vocoder(ref_mel_spec).squeeze(0)
+                            else:
+                                raise NotImplementedError(self.vocoder_name)
 
-                        torchaudio.save(f"{log_samples_path}/update_{global_update}_gen.wav", gen_audio, target_sample_rate)
-                        torchaudio.save(f"{log_samples_path}/update_{global_update}_ref.wav", ref_audio, target_sample_rate)
+                        torchaudio.save(f"{self.log_samples_path}/update_{global_update}_gen.wav", gen_audio, target_sample_rate)
+                        torchaudio.save(f"{self.log_samples_path}/update_{global_update}_ref.wav", ref_audio, target_sample_rate)
                         self.model.train()
 
             # Save checkpoint and evaluate at the end of each epoch

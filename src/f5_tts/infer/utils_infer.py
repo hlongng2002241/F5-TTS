@@ -211,6 +211,10 @@ def load_checkpoint(model, ckpt_path, device: str, dtype=None, use_ema=True):
             if key in checkpoint["model_state_dict"]:
                 del checkpoint["model_state_dict"][key]
 
+        for key in list(checkpoint["model_state_dict"].keys()):
+            if key.startswith("duration_predictor"):
+                checkpoint["model_state_dict"].pop(key)
+
         model.load_state_dict(checkpoint["model_state_dict"])
     else:
         if ckpt_type == "safetensors":
@@ -262,15 +266,11 @@ def load_model(
             method=ode_method,
         ),
         vocab_char_map=vocab_char_map,
-        use_mas=use_mas,
     ).to(device)
 
     dtype = torch.float32 if mel_spec_type == "bigvgan" else None
     dtype = torch.float32 if use_mas else dtype
     model = load_checkpoint(model, ckpt_path, device, dtype=dtype, use_ema=use_ema)
-
-    # model.use_mas = False
-    # model.transformer.text_embed.use_mas = False
 
     return model
 

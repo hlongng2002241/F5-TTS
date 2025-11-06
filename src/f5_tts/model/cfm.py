@@ -30,6 +30,7 @@ from f5_tts.model.utils import (
     list_str_to_idx,
     list_str_to_tensor,
     mask_from_frac_lengths,
+    mask_from_alignments,
 )
 
 
@@ -49,12 +50,14 @@ class CFM(nn.Module):
         mel_spec_module: nn.Module | None = None,
         mel_spec_kwargs: dict = dict(),
         frac_lengths_mask: tuple[float, float] = (0.7, 1.0),
-        vocab_char_map: dict[str:int] | None = None,
+        vocab_char_map: dict[str, int] | None = None,
         duration_predictor: DurationPredictor = None,
+        use_alignment_aware_masking: bool = False,  # Add alignment-aware masking parameter
     ):
         super().__init__()
 
         self.frac_lengths_mask = frac_lengths_mask
+        self.use_alignment_aware_masking = use_alignment_aware_masking  # Store alignment masking flag
 
         # mel spec
         self.mel_spec = default(mel_spec_module, MelSpec(**mel_spec_kwargs))
@@ -403,20 +406,20 @@ class CFM(nn.Module):
 
     def forward(
         self,
-        inp: float["b n d"] | float["b nw"],  # mel or raw wave
+        mel: float["b n d"] | float["b nw"],  # mel or raw wave
         text: int["b nt"] | list[str],
         *,
-        lens: int["b"] | None = None,
+        mel_lens: int["b"] | None = None,  # mel lengths
         noise_scheduler: str | None = None,
         mel_attn=None,
     ):
         # handle raw wave
-        if inp.ndim == 2:
-            inp = self.mel_spec(inp)
-            inp = inp.permute(0, 2, 1)
-            assert inp.shape[-1] == self.num_channels
+        if mel.ndim == 2:
+            mel = self.mel_spec(mel)
+            mel = mel.permute(0, 2, 1)
+            assert mel.shape[-1] == self.num_channels
 
-        batch, seq_len, dtype, device, _σ1 = *inp.shape[:2], inp.dtype, self.device, self.sigma
+        batch, seq_len, dtype, device, _σ1 = *mel.shape[:2], mel.dtype, self.device, self.sigma
 
         # handle text as string
         if isinstance(text, list):
@@ -429,19 +432,27 @@ class CFM(nn.Module):
         text_mask = (text != -1).int()
 
         # lens and mask
-        if not exists(lens):  # if lens not acquired by trainer from collate_fn
-            lens = torch.full((batch,), seq_len, device=device)
-        mask = lens_to_mask(lens, length=seq_len)
+        if not exists(mel_lens):  # if lens not acquired by trainer from collate_fn
+            mel_lens = torch.full((batch,), seq_len, device=device)
+        mel_mask = lens_to_mask(mel_lens, length=seq_len)
 
         # get a random span to mask out for training conditionally
         frac_lengths = torch.zeros((batch,), device=self.device).float().uniform_(*self.frac_lengths_mask)
-        rand_span_mask = mask_from_frac_lengths(lens, frac_lengths)
 
-        if exists(mask):
-            rand_span_mask &= mask
+        if self.use_alignment_aware_masking:
+            assert mel_attn is not None
+            # Alignment-aware masking: mask complete characters
+            # frac_lengths now represents fraction of characters to mask
+            rand_span_mask = mask_from_alignments(mel_attn, frac_lengths)
+        else:
+            # Simple random span masking (frame-based)
+            rand_span_mask = mask_from_frac_lengths(mel_lens, frac_lengths)
+
+        if exists(mel_mask):
+            rand_span_mask &= mel_mask
 
         # mel is x1
-        x1 = inp
+        x1 = mel
 
         # x0 is gaussian noise
         x0 = torch.randn_like(x1)
@@ -474,7 +485,7 @@ class CFM(nn.Module):
             time=time,
             drop_audio_cond=drop_audio_cond,
             drop_text=drop_text,
-            mask=mask,
+            mask=mel_mask,
             mel_attn=mel_attn,
         )
 
@@ -490,6 +501,6 @@ class CFM(nn.Module):
             dur_loss = torch.sum((logw - logw_) ** 2 * text_mask) / torch.sum(text_mask)
 
         else:
-            dur_loss =  torch.tensor(0.0).to(device=loss.device)
+            dur_loss = torch.tensor(0.0).to(device=loss.device)
 
         return loss, dur_loss, cond, pred

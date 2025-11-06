@@ -169,7 +169,7 @@ class Trainer:
                 mel_attn = batch.get("mel_attn")
 
                 loss, dur_loss, cond, pred = self.model(
-                    mel_spec, text=text_inputs, lens=mel_lengths, noise_scheduler=self.noise_scheduler, mel_attn=mel_attn
+                    mel_spec, text=text_inputs, mel_lens=mel_lengths, noise_scheduler=self.noise_scheduler, mel_attn=mel_attn
                 )
 
                 total_loss += loss.item()
@@ -354,6 +354,7 @@ class Trainer:
         restart=False,
     ):
         vocoder = None
+        target_sample_rate = None
         if self.log_samples:
             from f5_tts.infer.utils_infer import cfg_strength, load_vocoder, nfe_step, sway_sampling_coef
 
@@ -514,7 +515,7 @@ class Trainer:
                     #     self.accelerator.log({"duration loss": dur_loss.item()}, step=global_update)
 
                     loss, dur_loss, cond, pred = self.model(
-                        mel_spec, text=text_inputs, lens=mel_lengths, noise_scheduler=self.noise_scheduler, mel_attn=mel_attn
+                        mel_spec, text=text_inputs, mel_lens=mel_lengths, noise_scheduler=self.noise_scheduler, mel_attn=mel_attn
                     )
                     self.accelerator.backward(loss + dur_loss * 0.1)
 
@@ -564,7 +565,8 @@ class Trainer:
                         self.evaluate(test_dataloader, global_update)
 
                     if self.log_samples and self.accelerator.is_local_main_process:
-                        assert vocoder is not None
+                        print("Try to synthesize audio")
+                        assert vocoder is not None and target_sample_rate is not None
                         
                         ref_audio_len = mel_lengths[0]
                         infer_text = [text_inputs[0] + ([" "] if isinstance(text_inputs[0], list) else " ") + text_inputs[0]]

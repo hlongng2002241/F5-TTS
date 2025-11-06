@@ -84,25 +84,53 @@ class TextEmbedding(nn.Module):
 
         return upsampled_text
 
-    def forward(self, text: int["b nt"], seq_len, drop_text=False, audio_mask: bool["b n"] | None = None, mel_attn=None):
+    def forward(
+        self,
+        text: int["b nt"],
+        seq_len,
+        drop_text=False,
+        audio_mask: bool["b n"] | None = None,
+        mel_attn=None,
+        mel_attn_alpha=0.5,
+    ):
         text = text + 1  # use 0 as filler token. preprocess of batch pad -1, see list_str_to_idx()
         text = text[:, :seq_len]  # curtail if character tokens are more than the mel spec tokens
 
-        if mel_attn is None:
-            text = F.pad(text, (0, seq_len - text.shape[1]), value=0)  # (opt.) if not self.average_upsampling:
-        else:
-            assert self.average_upsampling is False
+        text_len = text.shape[1]
 
+        # Path 1: Global context (original approach) - always compute this
+        text_padded = F.pad(text, (0, seq_len - text_len), value=0)
+
+        # Initialize text_mask for later use
+        text_mask = None
         if self.mask_padding:
-            text_mask = text == 0
+            text_mask = text_padded == 0
 
         if drop_text:  # cfg for text
-            text = torch.zeros_like(text)
+            text_padded_dropped = torch.zeros_like(text_padded)
+        else:
+            text_padded_dropped = text_padded
 
-        text = self.text_embed(text)  # b n -> b n d
+        text_global = self.text_embed(text_padded_dropped)  # b n -> b n d
 
+        # Path 2: Local aligned context (when mel_attn provided)
         if mel_attn is not None:
-            text = torch.matmul(mel_attn.transpose(1, 2), text.float())
+            assert self.average_upsampling is False
+
+            # Embed unpadded text first
+            text_unpadded = text[:, :text_len]
+            if drop_text:
+                text_unpadded = torch.zeros_like(text_unpadded)
+            text_local_embed = self.text_embed(text_unpadded)  # [b, text_len, d]
+
+            # Apply alignment transformation
+            text_local = torch.matmul(mel_attn.transpose(1, 2), text_local_embed.float())  # [b, seq_len, d]
+
+            # Combine paths with configurable alpha
+            text = (1 - mel_attn_alpha) * text_global + mel_attn_alpha * text_local
+        else:
+            # Inference or no alignment: use only global path
+            text = text_global
 
         # possible extra modeling
         if self.extra_modeling:
@@ -111,14 +139,19 @@ class TextEmbedding(nn.Module):
 
             # convnextv2 blocks
             if self.mask_padding:
+                assert mel_attn is None and text_mask is not None  # Only apply mask for pure global path
+
                 text = text.masked_fill(text_mask.unsqueeze(-1).expand(-1, -1, text.size(-1)), 0.0)
                 for block in self.text_blocks:
                     text = block(text)
                     text = text.masked_fill(text_mask.unsqueeze(-1).expand(-1, -1, text.size(-1)), 0.0)
             else:
-                text = self.text_blocks(text)
+                # For dual path or when mel_attn is present, don't mask (alignment already handles positioning)
+                for block in self.text_blocks:
+                    text = block(text)
 
         if self.average_upsampling:
+            assert mel_attn is None and text_mask is not None
             text = self.average_upsample_text_by_mask(text, ~text_mask, audio_mask)
 
         return text
@@ -174,6 +207,7 @@ class DiT(nn.Module):
         attn_mask_enabled=False,
         long_skip_connection=False,
         checkpoint_activations=False,
+        mel_attn_alpha=0.5,  # Add dual path alpha parameter
     ):
         super().__init__()
 
@@ -194,6 +228,7 @@ class DiT(nn.Module):
 
         self.dim = dim
         self.depth = depth
+        self.mel_attn_alpha = mel_attn_alpha  # Store dual path alpha
 
         self.transformer_blocks = nn.ModuleList(
             [
@@ -253,7 +288,14 @@ class DiT(nn.Module):
     ):
         if self.text_uncond is None or self.text_cond is None or not cache:
             if audio_mask is None:
-                text_embed = self.text_embed(text, x.shape[1], drop_text=drop_text, audio_mask=audio_mask, mel_attn=mel_attn)
+                text_embed = self.text_embed(
+                    text,
+                    x.shape[1],
+                    drop_text=drop_text,
+                    audio_mask=audio_mask,
+                    mel_attn=mel_attn,
+                    mel_attn_alpha=self.mel_attn_alpha,
+                )
             else:
                 batch = x.shape[0]
                 seq_lens = audio_mask.sum(dim=1)
@@ -265,7 +307,8 @@ class DiT(nn.Module):
                         seq_len,
                         drop_text=drop_text,
                         audio_mask=audio_mask,
-                        mel_attn=mel_attn[i, :, :seq_len].unsqueeze(0),
+                        mel_attn=mel_attn[i, :, :seq_len].unsqueeze(0) if mel_attn is not None else None,
+                        mel_attn_alpha=self.mel_attn_alpha,
                     )
                     text_embed_list.append(text_embed_i[0])
                 text_embed = pad_sequence(text_embed_list, batch_first=True, padding_value=0)
@@ -308,12 +351,9 @@ class DiT(nn.Module):
         # t: conditioning time, text: text, x: noised audio + cond audio + text
         t = self.time_embed(time)
         if cfg_infer:  # pack cond & uncond forward: b n d -> 2b n d
-            x_cond = self.get_input_embed(
-                x, cond, text, drop_audio_cond=False, drop_text=False, cache=cache, audio_mask=mask, mel_attn=mel_attn
-            )
-            x_uncond = self.get_input_embed(
-                x, cond, text, drop_audio_cond=True, drop_text=True, cache=cache, audio_mask=mask, mel_attn=mel_attn
-            )
+            assert mel_attn is None, "Not support CFG inference with mel alignment"
+            x_cond = self.get_input_embed(x, cond, text, drop_audio_cond=False, drop_text=False, cache=cache, audio_mask=mask)
+            x_uncond = self.get_input_embed(x, cond, text, drop_audio_cond=True, drop_text=True, cache=cache, audio_mask=mask)
             x = torch.cat((x_cond, x_uncond), dim=0)
             t = torch.cat((t, t), dim=0)
             mask = torch.cat((mask, mask), dim=0) if mask is not None else None

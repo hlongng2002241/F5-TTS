@@ -68,6 +68,9 @@ def mask_from_start_end_indices(seq_len: int["b"], start: int["b"], end: int["b"
 
 
 def mask_from_frac_lengths(seq_len: int["b"], frac_lengths: float["b"]):
+    """
+    True is masked, otherwise False
+    """
     lengths = (frac_lengths * seq_len).long()
     max_start = seq_len - lengths
 
@@ -76,6 +79,63 @@ def mask_from_frac_lengths(seq_len: int["b"], frac_lengths: float["b"]):
     end = start + lengths
 
     return mask_from_start_end_indices(seq_len, start, end)
+
+
+def mask_from_alignments(mel_attn: torch.LongTensor, frac_lengths: torch.FloatTensor):
+    """
+    Create a mask based on alignment, masking complete characters.
+
+    Args:
+        mel_attn: Alignment matrix [batch, num_chars, mel_frames]
+        frac_lengths: Fraction of characters to mask [batch]
+
+    Returns:
+        mask: Boolean mask [batch, mel_frames]
+    """
+    batch_size, num_chars, mel_frames = mel_attn.shape
+    device = mel_attn.device
+
+    # Create mask for each sample in batch
+    mask = torch.zeros((batch_size, mel_frames), dtype=torch.bool, device=device)
+
+    for b in range(batch_size):
+        # Find characters that have aligned frames (non-zero duration)
+        char_has_frames = mel_attn[b].sum(dim=1) > 0  # [num_chars]
+        valid_char_indices = torch.where(char_has_frames)[0]
+
+        if len(valid_char_indices) == 0:
+            # Fallback: if no valid characters, skip this sample
+            continue
+
+        # Calculate how many characters to mask
+        num_valid_chars = len(valid_char_indices)
+        num_to_mask = int(frac_lengths[b] * num_valid_chars)
+        num_to_mask = max(1, num_to_mask)  # At least mask 1 character
+
+        # Randomly select a contiguous span of characters to mask
+        if num_to_mask < num_valid_chars:
+            # Select random starting position for the span
+            max_start = num_valid_chars - num_to_mask
+            start_idx = torch.randint(0, max_start + 1, (1,), device=device).item()
+            selected_indices = valid_char_indices[start_idx:start_idx + num_to_mask]
+        else:
+            # Mask all valid characters
+            selected_indices = valid_char_indices
+
+        # Find the frame range that covers all selected characters (including gaps)
+        # Get frames for each selected character
+        frames_mask = mel_attn[b, selected_indices, :].sum(dim=0) > 0
+
+        # Find the start and end of the mask region to make it contiguous
+        frame_indices = torch.where(frames_mask)[0]
+        if len(frame_indices) > 0:
+            start_frame = frame_indices[0].item()
+            end_frame = frame_indices[-1].item() + 1  # +1 for exclusive end
+
+            # Create a contiguous mask from start to end (includes any gaps)
+            mask[b, start_frame:end_frame] = True
+
+    return mask
 
 
 def maybe_masked_mean(t: float["b n d"], mask: bool["b n"] = None) -> float["b d"]:
@@ -222,93 +282,3 @@ def get_epss_timesteps(n, device, dtype):
     if not t:
         return torch.linspace(0, 1, n + 1, device=device, dtype=dtype)
     return dt * torch.tensor(t, device=device, dtype=dtype)
-
-
-# MAS (Monotonic Alignment Search) adaptation utilities
-
-
-def update_mas_alpha(model, global_step, warmup_steps=150000):
-    """
-    Gradually increase MAS alpha from 0 to 1 over warmup_steps.
-
-    Args:
-        model: CFM model with transformer.text_embed.mas_alpha buffer
-        global_step: current training step
-        warmup_steps: number of steps to reach full MAS (alpha=1)
-    """
-    alpha = min(1.0, global_step / warmup_steps)
-    if hasattr(model, 'transformer') and hasattr(model.transformer, 'text_embed'):
-        if hasattr(model.transformer.text_embed, 'mas_alpha'):
-            model.transformer.text_embed.mas_alpha.fill_(alpha)
-    return alpha
-
-
-def update_mas_temperature(model, global_step, warmup_steps=100000):
-    """
-    Gradually decrease MAS temperature from 10 to 1 over warmup_steps.
-
-    Args:
-        model: CFM model with transformer.text_embed.mas_temperature buffer
-        global_step: current training step
-        warmup_steps: number of steps to reach sharp attention (temp=1)
-    """
-    progress = min(1.0, global_step / warmup_steps)
-    temperature = 10.0 * (1 - progress) + 1.0 * progress
-    if hasattr(model, 'transformer') and hasattr(model.transformer, 'text_embed'):
-        if hasattr(model.transformer.text_embed, 'mas_temperature'):
-            model.transformer.text_embed.mas_temperature.fill_(temperature)
-    return temperature
-
-
-def load_checkpoint_with_mas(checkpoint_path, model, enable_mas=True):
-    """
-    Load V0/V1 checkpoint into model and optionally enable MAS components.
-
-    This function:
-    1. Loads V0/V1 checkpoint weights
-    2. If enable_mas=True, initializes MAS components (similarity_proj, mas_alpha, mas_temperature, mel_feature_proj)
-
-    Args:
-        checkpoint_path: path to V0/V1 checkpoint
-        model: CFM model (with or without MAS support)
-        enable_mas: whether to initialize MAS components after loading
-
-    Returns:
-        model: model with loaded weights and optionally initialized MAS components
-    """
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
-
-    # Handle different checkpoint formats
-    if 'model_state_dict' in checkpoint:
-        state_dict = checkpoint['model_state_dict']
-    elif 'ema_model_state_dict' in checkpoint:
-        # Extract and clean EMA state dict
-        state_dict = {
-            k.replace("ema_model.", ""): v
-            for k, v in checkpoint['ema_model_state_dict'].items()
-            if k not in ["initted", "step"]
-        }
-    else:
-        state_dict = checkpoint
-
-    # Load V0/V1 weights (MAS components don't exist in checkpoint, so strict=True works)
-    model.load_state_dict(state_dict, strict=True)
-    print(f"✓ Loaded V0/V1 checkpoint from: {checkpoint_path}")
-
-    # Initialize MAS components if requested
-    if enable_mas:
-        if hasattr(model, 'transformer') and hasattr(model.transformer, 'text_embed'):
-            text_dim = model.transformer.text_embed.text_embed.embedding_dim
-            model.transformer.text_embed.initialize_mas_components(text_dim)
-            print(f"✓ Initialized MAS components (text_dim={text_dim})")
-
-        # Initialize mel_feature_proj if model has use_mas=True
-        if hasattr(model, 'use_mas') and model.use_mas and model.mel_feature_proj is None:
-            num_channels = model.num_channels
-            text_dim = model.transformer.text_embed.text_embed.embedding_dim
-            model.mel_feature_proj = torch.nn.Linear(num_channels, text_dim)
-            torch.nn.init.xavier_uniform_(model.mel_feature_proj.weight)
-            torch.nn.init.zeros_(model.mel_feature_proj.bias)
-            print(f"✓ Initialized mel_feature_proj ({num_channels} → {text_dim})")
-
-    return model

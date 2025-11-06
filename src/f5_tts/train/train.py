@@ -42,11 +42,21 @@ def main(model_cfg):
     # )
     duration_predictor = None
 
+    # Pass mel_attn_alpha to the DiT model
+    model_arc_with_alpha = dict(model_arc)
+    if hasattr(model_cfg.model.arch, "mel_attn_alpha"):
+        model_arc_with_alpha["mel_attn_alpha"] = model_cfg.model.arch.mel_attn_alpha
+    if hasattr(model_cfg.model.arch, "use_alignment_aware_masking"):
+        model_arc_with_alpha.pop("use_alignment_aware_masking")
+
     model = CFM(
-        transformer=model_cls(**model_arc, text_num_embeds=vocab_size, mel_dim=model_cfg.model.mel_spec.n_mel_channels),
+        transformer=model_cls(
+            **model_arc_with_alpha, text_num_embeds=vocab_size, mel_dim=model_cfg.model.mel_spec.n_mel_channels
+        ),
         mel_spec_kwargs=model_cfg.model.mel_spec,
         vocab_char_map=vocab_char_map,
-        duration_predictor=duration_predictor
+        duration_predictor=duration_predictor,
+        use_alignment_aware_masking=getattr(model_cfg.model.arch, "use_alignment_aware_masking", False),
     )
 
     # Common trainer arguments

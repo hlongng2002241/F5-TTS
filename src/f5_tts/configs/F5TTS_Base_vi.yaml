@@ -39,6 +39,8 @@ model:
     attn_backend: torch  # torch | flash_attn
     attn_mask_enabled: False
     checkpoint_activations: True  # recompute activations and save memory for extra compute
+    mel_attn_alpha: 0.5  # Balanced between global context and local alignment (dataset now handles gaps properly)
+    use_alignment_aware_masking: True  # Mask complete characters instead of random frame spans
   mel_spec:
     target_sample_rate: 24000
     n_mel_channels: 100

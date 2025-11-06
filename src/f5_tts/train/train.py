@@ -46,8 +46,6 @@ def main(model_cfg):
     model_arc_with_alpha = dict(model_arc)
     if hasattr(model_cfg.model.arch, "mel_attn_alpha"):
         model_arc_with_alpha["mel_attn_alpha"] = model_cfg.model.arch.mel_attn_alpha
-    if hasattr(model_cfg.model.arch, "use_alignment_aware_masking"):
-        model_arc_with_alpha.pop("use_alignment_aware_masking")
 
     model = CFM(
         transformer=model_cls(
@@ -56,11 +54,11 @@ def main(model_cfg):
         mel_spec_kwargs=model_cfg.model.mel_spec,
         vocab_char_map=vocab_char_map,
         duration_predictor=duration_predictor,
-        use_alignment_aware_masking=getattr(model_cfg.model.arch, "use_alignment_aware_masking", False),
+        use_alignment_aware_masking=model_cfg.model.use_alignment_aware_masking,
     )
 
-    # Common trainer arguments
-    trainer_args = dict(
+    # Initialize trainer
+    trainer = Trainer(
         model=model,
         epochs=model_cfg.optim.epochs,
         learning_rate=model_cfg.optim.learning_rate,
@@ -79,16 +77,13 @@ def main(model_cfg):
         wandb_run_name=exp_name,
         wandb_resume_id=wandb_resume_id,
         last_per_updates=model_cfg.ckpts.last_per_updates,
-        log_samples=model_cfg.ckpts.log_samples,
+        log_samples_per_updates=model_cfg.ckpts.log_samples_per_updates,
         bnb_optimizer=model_cfg.optim.bnb_optimizer,
         mel_spec_type=mel_spec_type,
         is_local_vocoder=model_cfg.model.vocoder.is_local,
         local_vocoder_path=model_cfg.model.vocoder.local_path,
         model_cfg_dict=OmegaConf.to_container(model_cfg, resolve=True),
     )
-
-    # Initialize trainer
-    trainer = Trainer(**trainer_args)
 
     # train_dataset = load_dataset(model_cfg.datasets.name, tokenizer, mel_spec_kwargs=model_cfg.model.mel_spec)
     train_dataset = load_dataset_v2(model_cfg.datasets.train_path)

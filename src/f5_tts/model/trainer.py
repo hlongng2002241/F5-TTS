@@ -46,7 +46,7 @@ class Trainer:
         wandb_project="test_f5-tts",
         wandb_run_name="test_run",
         wandb_resume_id: str = None,
-        log_samples: bool = False,
+        log_samples_per_updates: int = 0,
         last_per_updates=None,
         accelerate_kwargs: dict = dict(),
         ema_kwargs: dict = dict(),
@@ -60,7 +60,7 @@ class Trainer:
 
         if logger == "wandb" and not wandb.api.api_key:
             logger = None
-        self.log_samples = log_samples
+        self.log_samples_per_updates = log_samples_per_updates
 
         self.accelerator = Accelerator(
             log_with=logger if logger == "wandb" else None,
@@ -97,10 +97,11 @@ class Trainer:
             )
 
         elif self.logger == "tensorboard":
-            from torch.utils.tensorboard import SummaryWriter
+            if self.accelerator.is_local_main_process:
+                from torch.utils.tensorboard import SummaryWriter
 
-            assert checkpoint_path is not None
-            self.writer = SummaryWriter(log_dir=os.path.join(checkpoint_path, "tensorboard"))
+                assert checkpoint_path is not None
+                self.writer = SummaryWriter(log_dir=os.path.join(checkpoint_path, "tensorboard"))
 
         self.model = model
 
@@ -353,9 +354,10 @@ class Trainer:
         resumable_with_seed: int = None,
         restart=False,
     ):
+        # Prepare for synthesizing audio sample
         vocoder = None
         target_sample_rate = None
-        if self.log_samples:
+        if self.log_samples_per_updates > 0:
             from f5_tts.infer.utils_infer import cfg_strength, load_vocoder, nfe_step, sway_sampling_coef
 
             vocoder = load_vocoder(
@@ -368,12 +370,46 @@ class Trainer:
             self.log_samples_path = f"{self.checkpoint_path}/samples"
             os.makedirs(self.log_samples_path, exist_ok=True)
 
+        def synthesize_sample():
+            print("Synthesize audio")
+            assert vocoder is not None and target_sample_rate is not None
+            self.model.eval()
+
+            ref_audio_len = mel_lengths[0]
+            infer_text = [text_inputs[0] + ([" "] if isinstance(text_inputs[0], list) else " ") + text_inputs[0]]
+            with torch.inference_mode():
+                generated, _ = self.accelerator.unwrap_model(self.model).sample(
+                    cond=mel_spec[0][:ref_audio_len].unsqueeze(0),
+                    text=infer_text,
+                    duration=ref_audio_len * 2,
+                    steps=nfe_step,
+                    cfg_strength=cfg_strength,
+                    sway_sampling_coef=sway_sampling_coef,
+                )
+                generated = generated.to(torch.float32)
+                gen_mel_spec = generated[:, ref_audio_len:, :].permute(0, 2, 1).cpu()
+                ref_mel_spec = batch["mel"][0].unsqueeze(0).cpu()
+                if self.vocoder_name == "vocos":
+                    gen_audio = vocoder.decode(gen_mel_spec)
+                    ref_audio = vocoder.decode(ref_mel_spec)
+                elif self.vocoder_name == "bigvgan":
+                    gen_audio = vocoder(gen_mel_spec).squeeze(0)
+                    ref_audio = vocoder(ref_mel_spec).squeeze(0)
+                else:
+                    raise NotImplementedError(self.vocoder_name)
+
+            torchaudio.save(f"{self.log_samples_path}/update_{global_update}_gen.wav", gen_audio, target_sample_rate)
+            torchaudio.save(f"{self.log_samples_path}/update_{global_update}_ref.wav", ref_audio, target_sample_rate)
+            self.model.train()
+
+        # Prepapre seed
         if exists(resumable_with_seed):
             generator = torch.Generator()
             generator.manual_seed(resumable_with_seed)
         else:
             generator = None
 
+        # Create train dataloader
         if self.batch_size_type == "sample":
             train_dataloader = DataLoader(
                 train_dataset,
@@ -448,6 +484,8 @@ class Trainer:
 
         #  accelerator.prepare() dispatches batches to devices;
         #  which means the length of dataloader calculated before, should consider the number of devices
+
+        # Create scheduler
         warmup_updates = (
             self.num_warmup_updates * self.accelerator.num_processes
         )  # consider a fixed warmup steps while using accelerate multi-gpu ddp
@@ -457,9 +495,13 @@ class Trainer:
         warmup_scheduler = LinearLR(self.optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_updates)
         decay_scheduler = LinearLR(self.optimizer, start_factor=1.0, end_factor=1e-8, total_iters=decay_updates)
         self.scheduler = SequentialLR(self.optimizer, schedulers=[warmup_scheduler, decay_scheduler], milestones=[warmup_updates])
+
+        # Apply to accelerator
         train_dataloader, self.scheduler = self.accelerator.prepare(
             train_dataloader, self.scheduler
         )  # actual multi_gpu updates = single_gpu updates / gpu nums
+
+        # Loading checkpoint
         start_update = self.load_checkpoint(resume_from_checkpoint)
         if restart:
             start_update = 0
@@ -477,6 +519,7 @@ class Trainer:
         if eval_first:
             self.evaluate(test_dataloader, global_update)
 
+        # Train
         for epoch in tqdm(list(range(skipped_epoch, self.epochs)), desc="Training"):
             # Synchronize all processes at the start of each epoch
             self.accelerator.wait_for_everyone()
@@ -538,8 +581,10 @@ class Trainer:
                         OrderedDict(
                             update=str(global_update),
                             batch_size=len(text_inputs),
+                            lr=self.scheduler.get_last_lr()[0],
                             loss=loss.item(),
                             dur_loss=dur_loss.item(),
+                            has_attn=mel_attn is not None,
                         )
                     )
 
@@ -564,42 +609,23 @@ class Trainer:
                     if test_dataloader is not None:
                         self.evaluate(test_dataloader, global_update)
 
-                    if self.log_samples and self.accelerator.is_local_main_process:
-                        print("Try to synthesize audio")
-                        assert vocoder is not None and target_sample_rate is not None
-                        
-                        ref_audio_len = mel_lengths[0]
-                        infer_text = [text_inputs[0] + ([" "] if isinstance(text_inputs[0], list) else " ") + text_inputs[0]]
-                        with torch.inference_mode():
-                            generated, _ = self.accelerator.unwrap_model(self.model).sample(
-                                cond=mel_spec[0][:ref_audio_len].unsqueeze(0),
-                                text=infer_text,
-                                duration=ref_audio_len * 2,
-                                steps=nfe_step,
-                                cfg_strength=cfg_strength,
-                                sway_sampling_coef=sway_sampling_coef,
-                            )
-                            generated = generated.to(torch.float32)
-                            gen_mel_spec = generated[:, ref_audio_len:, :].permute(0, 2, 1).cpu()
-                            ref_mel_spec = batch["mel"][0].unsqueeze(0).cpu()
-                            if self.vocoder_name == "vocos":
-                                gen_audio = vocoder.decode(gen_mel_spec)
-                                ref_audio = vocoder.decode(ref_mel_spec)
-                            elif self.vocoder_name == "bigvgan":
-                                gen_audio = vocoder(gen_mel_spec).squeeze(0)
-                                ref_audio = vocoder(ref_mel_spec).squeeze(0)
-                            else:
-                                raise NotImplementedError(self.vocoder_name)
-
-                        torchaudio.save(f"{self.log_samples_path}/update_{global_update}_gen.wav", gen_audio, target_sample_rate)
-                        torchaudio.save(f"{self.log_samples_path}/update_{global_update}_ref.wav", ref_audio, target_sample_rate)
-                        self.model.train()
+                if (
+                    self.log_samples_per_updates > 0
+                    and global_update % self.log_samples_per_updates == 0
+                    and self.accelerator.is_local_main_process
+                ):
+                    synthesize_sample()
 
             # Save checkpoint and evaluate at the end of each epoch
             progress_bar.close()
+
             self.save_checkpoint(global_update, epoch=epoch)
+
             if test_dataloader is not None:
                 self.evaluate(test_dataloader, global_update)
+
+            if self.log_samples_per_updates > 0 and self.accelerator.is_local_main_process:
+                synthesize_sample()
 
         self.save_checkpoint(global_update, last=True)
 

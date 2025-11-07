@@ -440,7 +440,7 @@ class CFM(nn.Module):
         frac_lengths = torch.zeros((batch,), device=self.device).float().uniform_(*self.frac_lengths_mask)
 
         if self.use_alignment_aware_masking:
-            assert mel_attn is not None
+            assert mel_attn is not None, "mel_attn must be provided"
             # Alignment-aware masking: mask complete characters
             # frac_lengths now represents fraction of characters to mask
             rand_span_mask = mask_from_alignments(mel_attn, frac_lengths)

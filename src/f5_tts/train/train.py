@@ -96,6 +96,7 @@ def main(model_cfg):
         num_workers=model_cfg.datasets.num_workers,
         resumable_with_seed=666,  # seed for shuffling dataset
         restart=model_cfg.optim.restart,
+        synthesize_path=model_cfg.datasets.synthesize_path,
     )
 
 

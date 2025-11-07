@@ -10,6 +10,7 @@ datasets:
   num_workers: 16
   train_path: ???
   test_path: ???
+  synthesize_path: data/vi/synthesize.json
 
 optim:
   epochs: 100
@@ -19,6 +20,7 @@ optim:
   max_grad_norm: 1.0  # gradient clipping
   bnb_optimizer: False  # use bnb 8bit AdamW optimizer or not
   eval_first: False
+  restart: False
 
 model:
   name: F5TTS_v1_Base_vi  # model name
@@ -35,9 +37,11 @@ model:
     qk_norm: null  # null | rms_norm
     conv_layers: 4
     pe_attn_head: null
-    attn_backend: flash_attn  # torch | flash_attn
+    attn_backend: torch  # torch | flash_attn
     attn_mask_enabled: False
-    checkpoint_activations: False  # recompute activations and save memory for extra compute
+    checkpoint_activations: True  # recompute activations and save memory for extra compute
+    mel_attn_alpha: 0.5  # Balanced between global context and local alignment (dataset now handles gaps properly)
+  use_alignment_aware_masking: True  # Mask complete characters instead of random frame spans
   mel_spec:
     target_sample_rate: 24000
     n_mel_channels: 100
@@ -51,7 +55,7 @@ model:
 
 ckpts:
   logger: tensorboard  # wandb | tensorboard | null
-  log_samples: True  # infer random sample per save checkpoint. wip, normal to fail with extra long samples
+  log_samples_per_updates: 500 # infer random sample per save checkpoint. wip, normal to fail with extra long samples
   save_per_updates: 50000  # save checkpoint per updates
   keep_last_n_checkpoints: -1  # -1 to keep all, 0 to not save intermediate, > 0 to keep last N checkpoints
   last_per_updates: 5000  # save last checkpoint per updates

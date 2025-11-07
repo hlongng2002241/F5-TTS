@@ -139,14 +139,13 @@ class TextEmbedding(nn.Module):
 
             # convnextv2 blocks
             if self.mask_padding:
-                assert mel_attn is None and text_mask is not None  # Only apply mask for pure global path
+                assert text_mask is not None
 
                 text = text.masked_fill(text_mask.unsqueeze(-1).expand(-1, -1, text.size(-1)), 0.0)
                 for block in self.text_blocks:
                     text = block(text)
                     text = text.masked_fill(text_mask.unsqueeze(-1).expand(-1, -1, text.size(-1)), 0.0)
             else:
-                # For dual path or when mel_attn is present, don't mask (alignment already handles positioning)
                 for block in self.text_blocks:
                     text = block(text)
 

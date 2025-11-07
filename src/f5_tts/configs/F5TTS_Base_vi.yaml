@@ -1,6 +1,5 @@
 hydra:
   run:
-    # dir: ${ckpts.save_dir}/${now:%Y-%m-%d}_${now:%H-%M-%S}
     dir: ${ckpts.save_dir}
 
 datasets:
@@ -11,6 +10,10 @@ datasets:
   num_workers: 16
   train_path: ???
   test_path: ???
+  synthesize_metadata:
+    prompt_audio_path: data/ref_audio/Minh_Chau.wav
+    prompt_text: có gì không hài lòng mong chị phản hồi lại với mình , mình sẽ cố gắng giúp chị có trải nghiệm tuyệt vời khi mua hàng tại cửa hàng ạ .
+    gen_text: Nếu phải mô phỏng một kỷ niệm , đó sẽ là khoảnh khắc tôi xử lý hàng tỷ điểm dữ liệu
 
 optim:
   epochs: 11
@@ -23,8 +26,8 @@ optim:
   restart: False
 
 model:
-  name: F5TTS_Base  # model name
-  tokenizer: pinyin  # tokenizer type
+  name: F5TTS_Base_vi  # model name
+  tokenizer: custom  # tokenizer type
   tokenizer_path: null  # if 'custom' tokenizer, define the path want to use (should be vocab.txt)
   backbone: DiT
   arch:

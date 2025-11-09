@@ -282,3 +282,105 @@ def get_epss_timesteps(n, device, dtype):
     if not t:
         return torch.linspace(0, 1, n + 1, device=device, dtype=dtype)
     return dt * torch.tensor(t, device=device, dtype=dtype)
+
+
+# alignment
+
+
+def match_alignment(tokens: list[str], alignments: list, duration: float, sample_rate: int, hop_length: int, expand_gap=True):
+    aligned_tokens = [a[0] for a in alignments if a[0] != "sp"]
+    for a in aligned_tokens:
+        assert a.strip() != "", 1
+
+    text_tokens_non_space = [t for t in tokens if t != " "]
+    # print(aligned_tokens)
+    # print(text_tokens_non_space)
+    assert aligned_tokens == text_tokens_non_space, 2
+    assert len(aligned_tokens) <= len(tokens), 3
+
+    i_align = 0
+    full_alignments = []
+    for i_text in range(len(tokens)):
+        t_token = tokens[i_text]
+        if t_token == " ":
+            if alignments[i_align][0] == "sp":
+                full_alignments.append((" ", alignments[i_align][1], alignments[i_align][2]))
+                i_align += 1
+            else:
+                assert tokens[i_text - 1] == alignments[i_align - 1][0], 4
+                assert tokens[i_text + 1] == alignments[i_align][0], 5
+                full_alignments.append((" ", alignments[i_align - 1][2], alignments[i_align][1]))
+        else:
+            assert t_token == alignments[i_align][0], 6
+            full_alignments.append(alignments[i_align])
+            i_align += 1
+
+    for index in range(1, len(full_alignments)):
+        prev = full_alignments[index - 1]
+        cur = full_alignments[index]
+        assert prev[2] <= cur[1], 7
+
+    if expand_gap:
+        full_alignments, unexpanded_gaps = expand_alignment_gaps(full_alignments)
+    else:
+        unexpanded_gaps = []
+        for index in range(len(full_alignments) - 1):
+            cur = full_alignments[index]
+            nxt = full_alignments[index + 1]
+            if nxt[1] - cur[2] > 0:
+                unexpanded_gaps.append((nxt[1] - cur[2], cur, nxt))
+
+    for index in range(1, len(full_alignments)):
+        prev = full_alignments[index - 1]
+        cur = full_alignments[index]
+        assert prev[2] <= cur[1], 8
+
+    mel_len = int(duration * sample_rate / hop_length)
+    mel_alignments = []
+    mel_durations = []
+    for t, s, e in full_alignments:
+        # based on statistic, remove sample that have " " lasting longer than 2 seconds
+        if t == " " and e - s > 2:
+            raise ValueError(10)
+            
+        s = round(s * sample_rate / hop_length)
+        e = round(e * sample_rate / hop_length)
+        assert s <= e, 20
+        assert e <= mel_len, (30, e, mel_len)
+        mel_durations.append(e - s)
+        if e - s == 0:
+            assert t == " ", 40
+        mel_alignments.append((s, e))
+
+    assert len(mel_durations) == len(tokens), 50
+    assert sum(mel_durations) <= mel_len, 60
+    assert len(mel_alignments) == len(tokens), 70
+
+    return mel_alignments, unexpanded_gaps
+
+
+def expand_alignment_gaps(full_alignments: list[tuple[str, float, float]]):
+    full_alignments = [list(ali) for ali in full_alignments]
+    removed_indexes = []
+    unexpanded_gaps = []
+
+    for index in range(len(full_alignments) - 1):
+        cur = full_alignments[index]
+        nxt = full_alignments[index + 1]
+        if nxt[1] - cur[2] > 0:
+            if cur[0] == " " and nxt[0] == " ":
+                nxt[1] = cur[1]
+                removed_indexes.append(index)
+
+            elif cur[0] == " ":
+                cur[2] = nxt[1]
+
+            elif nxt[0] == " ":
+                nxt[1] = cur[2]
+
+            else:
+                unexpanded_gaps.append((nxt[1] - cur[2], cur, nxt))
+
+    full_alignments = [tuple(ali) for index, ali in enumerate(full_alignments) if index not in removed_indexes]
+
+    return full_alignments, unexpanded_gaps

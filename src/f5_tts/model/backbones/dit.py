@@ -350,9 +350,13 @@ class DiT(nn.Module):
         # t: conditioning time, text: text, x: noised audio + cond audio + text
         t = self.time_embed(time)
         if cfg_infer:  # pack cond & uncond forward: b n d -> 2b n d
-            assert mel_attn is None, "Not support CFG inference with mel alignment"
-            x_cond = self.get_input_embed(x, cond, text, drop_audio_cond=False, drop_text=False, cache=cache, audio_mask=mask)
-            x_uncond = self.get_input_embed(x, cond, text, drop_audio_cond=True, drop_text=True, cache=cache, audio_mask=mask)
+            # assert mel_attn is None, "Not support CFG inference with mel alignment"
+            x_cond = self.get_input_embed(
+                x, cond, text, drop_audio_cond=False, drop_text=False, cache=cache, audio_mask=mask, mel_attn=mel_attn
+            )
+            x_uncond = self.get_input_embed(
+                x, cond, text, drop_audio_cond=True, drop_text=True, cache=cache, audio_mask=mask, mel_attn=mel_attn
+            )
             x = torch.cat((x_cond, x_uncond), dim=0)
             t = torch.cat((t, t), dim=0)
             mask = torch.cat((mask, mask), dim=0) if mask is not None else None

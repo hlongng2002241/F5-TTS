@@ -1,5 +1,6 @@
 import argparse
 import codecs
+import json
 import os
 import re
 from datetime import datetime
@@ -20,6 +21,8 @@ from f5_tts.infer.utils_infer import (
     device,
     fix_duration,
     infer_batch_synthesized_on_left,
+    infer_with_dp,
+    load_duration_predictor,
     infer_process,
     load_model,
     load_vocoder,
@@ -68,6 +71,13 @@ parser.add_argument(
     help="The path to model checkpoint .pt, leave blank to use default",
 )
 parser.add_argument(
+    "-dp",
+    "--dp_ckpt",
+    type=str,
+    default=None,
+    help="The path to duration predictor checkpoint .pt, leave blank to use default",
+)
+parser.add_argument(
     "-v",
     "--vocab_file",
     type=str,
@@ -84,6 +94,17 @@ parser.add_argument(
     "--ref_text",
     type=str,
     help="The transcript/subtitle for the reference audio",
+)
+parser.add_argument(
+    "-a",
+    "--ref_ali",
+    type=str,
+    help="The text-mel alignment for the reference audio",
+)
+parser.add_argument(
+    "-npr",
+    "--no_preprocess_ref_audio",
+    action="store_true"
 )
 parser.add_argument(
     "-t",
@@ -242,6 +263,12 @@ if gen_file:
     gen_text = codecs.open(gen_file, "r", "utf-8").read()
 
 
+ref_ali = None
+if args.ref_ali is not None:
+    print("Loading alignment at", args.ref_ali)
+    with open(args.ref_ali) as f:
+        ref_ali = json.load(f)["alignments"]
+
 # output path
 
 wave_path = Path(output_dir) / output_file
@@ -296,6 +323,16 @@ ema_model = load_model(
     model_cls, model_arc, ckpt_file, mel_spec_type=vocoder_name, vocab_file=vocab_file, device=device
 )
 
+dp_model = None
+if args.dp_ckpt is not None:
+    print("Loading duration predictor at", args.dp_ckpt)
+    dp_model = load_duration_predictor(
+        text_num_embeds=len(ema_model.vocab_char_map),
+        dp_config=model_cfg.model.duration_predictor,
+        path=args.dp_ckpt,
+        device=device,
+    )
+
 
 # inference process
 
@@ -310,9 +347,10 @@ def main():
     for voice in voices:
         print("Voice:", voice)
         print("ref_audio ", voices[voice]["ref_audio"])
-        voices[voice]["ref_audio"], voices[voice]["ref_text"] = preprocess_ref_audio_text(
-            voices[voice]["ref_audio"], voices[voice]["ref_text"]
-        )
+        if args.no_preprocess_ref_audio is False:
+            voices[voice]["ref_audio"], voices[voice]["ref_text"] = preprocess_ref_audio_text(
+                voices[voice]["ref_audio"], voices[voice]["ref_text"]
+            )
         print("ref_audio_", voices[voice]["ref_audio"], "\n\n")
 
     generated_audio_segments = []
@@ -343,23 +381,43 @@ def main():
         # ref_text_ = [ref_text_, ref_text_]
         # gen_text_ = [gen_text_, "tối nay đi chơi thôi."]
 
-        audio_segment, final_sample_rate, spectrogram = infer_process(
-        # audio_segment, final_sample_rate = infer_batch_synthesized_on_left(
-            ref_audio_,
-            ref_text_,
-            gen_text_,
-            ema_model,
-            vocoder,
-            mel_spec_type=vocoder_name,
-            target_rms=target_rms,
-            cross_fade_duration=cross_fade_duration,
-            nfe_step=nfe_step,
-            cfg_strength=cfg_strength,
-            sway_sampling_coef=sway_sampling_coef,
-            speed=local_speed,
-            fix_duration=fix_duration,
-            device=device,
-        )
+        if dp_model is not None:
+            audio_segment, final_sample_rate, spectrogram = infer_with_dp(
+                ref_audio=ref_audio_,
+                ref_text=ref_text_,
+                ref_ali=ref_ali,
+                gen_text=gen_text_,
+                model=ema_model,
+                vocoder=vocoder,
+                duration_predictor=dp_model,
+                mel_spec_type=vocoder_name,
+                target_rms=target_rms,
+                nfe_step=nfe_step,
+                cfg_strength=cfg_strength,
+                sway_sampling_coef=sway_sampling_coef,
+                speed=local_speed,
+                device=device,
+            )
+
+        else:
+            audio_segment, final_sample_rate, spectrogram = infer_process(
+            # audio_segment, final_sample_rate = infer_batch_synthesized_on_left(
+                ref_audio_,
+                ref_text_,
+                gen_text_,
+                ema_model,
+                vocoder,
+                mel_spec_type=vocoder_name,
+                target_rms=target_rms,
+                cross_fade_duration=cross_fade_duration,
+                nfe_step=nfe_step,
+                cfg_strength=cfg_strength,
+                sway_sampling_coef=sway_sampling_coef,
+                speed=local_speed,
+                fix_duration=fix_duration,
+                device=device,
+            )
+
         if isinstance(audio_segment, list): # is infer_batch, not infer_process
             for idx, ag in enumerate(audio_segment):
                 sf.write(f"temp/tmp_{idx}.wav", ag, 24000)

@@ -94,6 +94,7 @@ class CustomDataset(Dataset):
         mel_spec_type="vocos",
         preprocessed_mel=False,
         mel_spec_module: nn.Module | None = None,
+        skip_audio=False,
     ):
         self.data = custom_dataset
         self.durations = durations
@@ -103,6 +104,7 @@ class CustomDataset(Dataset):
         self.win_length = win_length
         self.mel_spec_type = mel_spec_type
         self.preprocessed_mel = preprocessed_mel
+        self.skip_audio = skip_audio
 
         if not preprocessed_mel:
             self.mel_spectrogram = default(
@@ -138,6 +140,8 @@ class CustomDataset(Dataset):
 
             index = (index + 1) % len(self.data)
 
+        if self.skip_audio:
+            pass
         if self.preprocessed_mel:
             mel_spec = torch.tensor(row["mel_spec"])
         else:
@@ -161,19 +165,48 @@ class CustomDataset(Dataset):
             "text": text,
         }
 
+        mel_length = int(row["duration"] * self.target_sample_rate / self.hop_length)
+
+        if self.skip_audio:
+            ret["mel_length"] = mel_length
+
         if "mel_alignments" in row:
-            mel_length = int(row["duration"] * self.target_sample_rate / self.hop_length)
             mel_attn = prepare_attn(row["mel_alignments"], mel_length)
             ret["mel_attn"] = mel_attn
 
         return ret
 
 
-def prepare_attn(mel_alignments: list, mel_length: int):
-    attn = torch.zeros((len(mel_alignments), mel_length)).float()
-    for i_text, (s, e) in enumerate(mel_alignments):
-        attn[i_text, s:e] = 1.0
-    return attn
+def prepare_attn(mel_alignments: list[tuple[int, int]], mel_length: int):
+    alignments_tensor = torch.tensor(mel_alignments, dtype=torch.long)  # [num_text, 2]
+    starts = alignments_tensor[:, 0]  # [num_text]
+    ends = alignments_tensor[:, 1]  # [num_text]
+
+    mel_range = torch.arange(mel_length)  # [mel_length]
+
+    # Broadcasting: [num_text, 1] vs [mel_length] -> [num_text, mel_length]
+    attn = (mel_range >= starts.unsqueeze(1)) & (mel_range < ends.unsqueeze(1))
+
+    return attn.float()
+
+
+def prepare_attn_from_durations(duration: torch.Tensor | list[int | float]):
+    # durations [text_len]
+    if isinstance(duration, list):
+        duration = torch.LongTensor(duration)
+    duration = duration.int()
+    mel_range = torch.arange(int(duration.sum().item()), device=duration.device)
+    ends = duration.cumsum(0)
+    starts = torch.cat([torch.zeros(1, dtype=torch.long, device=duration.device), ends[:-1]])
+
+    # Broadcasting: [num_text, 1] vs [mel_length] -> [num_text, mel_length]
+    attn = (mel_range >= starts.unsqueeze(1)) & (mel_range < ends.unsqueeze(1))
+
+    return attn.float()
+
+
+def concat_attn(attns: list[torch.Tensor]):
+    return torch.block_diag(*attns)
 
 
 # Dynamic Batch Sampler
@@ -356,42 +389,49 @@ def load_dataset_v2(path: str):
 # collation
 
 
+def pad_attn(attn_matrices: list[torch.Tensor], max_text_length: int, max_mel_length: int):
+    padded_attn_matrices = []
+    for attn in attn_matrices:
+        attn = torch.tensor(np.array(attn))
+        attn_height, attn_width = attn.shape
+        pad_height = max(0, max_text_length - attn_height)
+        pad_width = max(0, max_mel_length - attn_width)
+        padded_attn = F.pad(attn, (0, pad_width, 0, pad_height), value=0)
+        padded_attn_matrices.append(padded_attn)
+    attn = torch.stack(padded_attn_matrices)
+    return attn
+
+
 def collate_fn(batch):
     first = batch[0]
-    mel_specs = [item["mel_spec"].squeeze(0) for item in batch]
-    mel_lengths = torch.LongTensor([spec.shape[-1] for spec in mel_specs])
-    max_mel_length = mel_lengths.amax()
+    ret = {}
 
-    padded_mel_specs = []
-    for spec in mel_specs:
-        padding = (0, max_mel_length - spec.size(-1))
-        padded_spec = F.pad(spec, padding, value=0)
-        padded_mel_specs.append(padded_spec)
+    if "mel_spec" in first:
+        mel_specs = [item["mel_spec"].squeeze(0) for item in batch]
+        mel_lengths = torch.LongTensor([spec.shape[-1] for spec in mel_specs])
+        max_mel_length = mel_lengths.amax()
 
-    mel_specs = torch.stack(padded_mel_specs)
+        padded_mel_specs = []
+        for spec in mel_specs:
+            padding = (0, max_mel_length - spec.size(-1))
+            padded_spec = F.pad(spec, padding, value=0)
+            padded_mel_specs.append(padded_spec)
+
+        mel_specs = torch.stack(padded_mel_specs)
+        ret["mel"] = mel_specs
+        ret["mel_lengths"] = mel_lengths
+
+    else:
+        mel_lengths = torch.LongTensor([item["mel_length"] for item in batch])
+        max_mel_length = mel_lengths.amax()
 
     text = [item["text"] for item in batch]
     text_lengths = torch.LongTensor([len(item) for item in text])
-    max_text_length = text_lengths.amax()
-
-    ret = dict(
-        mel=mel_specs,
-        mel_lengths=mel_lengths,  # records for padding mask
-        text=text,
-        text_lengths=text_lengths,
-    )
+    ret["text"] = text
+    ret["text_lengths"] = text_lengths
 
     if "mel_attn" in first:
         attn_matrices = [item["mel_attn"] for item in batch]
-        padded_attn_matrices = []
-        for attn in attn_matrices:
-            attn = torch.tensor(np.array(attn))
-            attn_height, attn_width = attn.shape
-            pad_height = max(0, max_text_length - attn_height)
-            pad_width = max(0, max_mel_length - attn_width)
-            padded_attn = F.pad(attn, (0, pad_width, 0, pad_height), value=0)
-            padded_attn_matrices.append(padded_attn)
-        attn = torch.stack(padded_attn_matrices)
-        ret["mel_attn"] = attn
+        ret["mel_attn"] = pad_attn(attn_matrices, text_lengths.amax(), max_mel_length)
 
     return ret

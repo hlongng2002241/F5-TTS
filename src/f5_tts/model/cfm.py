@@ -107,6 +107,7 @@ class CFM(nn.Module):
         duplicate_test=False,
         t_inter=0.1,
         edit_mask=None,
+        mel_attn=None,
     ):
         self.eval()
         # raw wave
@@ -183,6 +184,7 @@ class CFM(nn.Module):
                     drop_audio_cond=False,
                     drop_text=False,
                     cache=True,
+                    mel_attn=mel_attn
                 )
             else:
                 # predict flow (cond and uncond), for classifier-free guidance
@@ -194,6 +196,7 @@ class CFM(nn.Module):
                     mask=mask,
                     cfg_infer=True,
                     cache=True,
+                    mel_attn=mel_attn
                 )
                 pred, null_pred = torch.chunk(pred_cfg, 2, dim=0)
                 pred = pred + (pred - null_pred) * cfg_strength

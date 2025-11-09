@@ -52,6 +52,11 @@ model:
   vocoder:
     is_local: False  # use local offline ckpt or not
     local_path: null  # local vocoder path
+  duration_predictor:
+    text_dim: 512
+    filter_channels: 32
+    kernel_size: 3
+    dropout: 0.5
 
 ckpts:
   logger: tensorboard  # wandb | tensorboard | null

@@ -4,27 +4,26 @@ import torch
 
 
 class DurationPredictor(nn.Module):
-    def __init__(self, text_num_embeds, in_channels, filter_channels, kernel_size, p_dropout, gin_channels=0):
+    def __init__(self, text_num_embeds, text_dim, filter_channels, kernel_size, dropout, gin_channels=0):
         super().__init__()
 
-        text_dim = in_channels
         self.text_embed = nn.Embedding(text_num_embeds + 1, text_dim)  # use 0 as filler token
 
-        self.in_channels = in_channels
+        self.in_channels = text_dim
         self.filter_channels = filter_channels
         self.kernel_size = kernel_size
-        self.p_dropout = p_dropout
+        self.p_dropout = dropout
         self.gin_channels = gin_channels
 
-        self.drop = nn.Dropout(p_dropout)
-        self.conv_1 = nn.Conv1d(in_channels, filter_channels, kernel_size, padding=kernel_size // 2)
+        self.drop = nn.Dropout(dropout)
+        self.conv_1 = nn.Conv1d(text_dim, filter_channels, kernel_size, padding=kernel_size // 2)
         self.norm_1 = modules.LayerNorm(filter_channels)
         self.conv_2 = nn.Conv1d(filter_channels, filter_channels, kernel_size, padding=kernel_size // 2)
         self.norm_2 = modules.LayerNorm(filter_channels)
         self.proj = nn.Conv1d(filter_channels, 1, 1)
 
         if gin_channels != 0:
-            self.cond = nn.Conv1d(gin_channels, in_channels, 1)
+            self.cond = nn.Conv1d(gin_channels, text_dim, 1)
 
     def forward(self, x, x_mask, g=None):
         x = x + 1  # use 0 as filler token. preprocess of batch pad -1, see list_str_to_idx()

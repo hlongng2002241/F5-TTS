@@ -29,7 +29,9 @@ from transformers import pipeline
 from vocos import Vocos
 
 from f5_tts.model import CFM
-from f5_tts.model.utils import convert_char_to_pinyin, get_tokenizer, list_str_to_idx
+from f5_tts.model.utils import convert_char_to_pinyin, get_tokenizer, list_str_to_idx, match_alignment
+from f5_tts.model.duration_predictor import DurationPredictor
+from f5_tts.model.dataset import prepare_attn, prepare_attn_from_durations, concat_attn
 
 
 _ref_audio_cache = {}
@@ -239,7 +241,7 @@ def load_model(
     ode_method=ode_method,
     use_ema=True,
     device=device,
-):
+) -> CFM:
     if vocab_file == "":
         vocab_file = str(files("f5_tts").joinpath("infer/examples/vocab.txt"))
     tokenizer = "custom"
@@ -265,7 +267,8 @@ def load_model(
         vocab_char_map=vocab_char_map,
     ).to(device)
 
-    dtype = torch.float32 if mel_spec_type == "bigvgan" else None
+    # dtype = torch.float32 if mel_spec_type == "bigvgan" else None
+    dtype = torch.float32
     model = load_checkpoint(model, ckpt_path, device, dtype=dtype, use_ema=use_ema)
 
     return model
@@ -955,3 +958,111 @@ def infer_batch_synthesized_on_left(
         final_audio_list.append(final_audio)
 
     return final_audio_list, target_sample_rate
+
+
+def load_duration_predictor(text_num_embeds: int, dp_config: dict, path: str, device="cuda"):
+    dp = DurationPredictor(text_num_embeds=text_num_embeds, **dp_config).to(device)
+    checkpoint = torch.load(path, map_location="cpu")
+    dp.load_state_dict(checkpoint["model_state_dict"])
+    return dp
+
+
+def infer_with_dp(
+    ref_audio: str,
+    ref_text: str,
+    ref_ali: list[tuple[str, float, float]],
+    gen_text: str,
+    model: CFM,
+    vocoder: Vocos,
+    duration_predictor: DurationPredictor,
+    mel_spec_type="vocos",
+    target_rms=0.1,
+    nfe_step=32,
+    cfg_strength=2.0,
+    sway_sampling_coef=-1,
+    speed=1,
+    device=None,
+):
+    audio, sr = torchaudio.load(ref_audio)
+    if audio.shape[0] > 1:
+        audio = torch.mean(audio, dim=0, keepdim=True)
+
+    rms = torch.sqrt(torch.mean(torch.square(audio)))
+    if rms < target_rms:
+        audio = audio * target_rms / rms
+    if sr != target_sample_rate:
+        resampler = torchaudio.transforms.Resample(sr, target_sample_rate)
+        audio = resampler(audio)
+    audio = audio.to(device)
+
+    with torch.inference_mode():
+        ref_mel = model.mel_spec(audio.unsqueeze(0).cuda()).permute(0, 2, 1)  # [1, mel_len, n_mel]
+
+    # if len(ref_text[-1].encode("utf-8")) == 1:
+    #     ref_text = ref_text + " "
+
+    # local_speed = speed
+    # if len(gen_text.encode("utf-8")) < 10:
+    #     local_speed = 0.3
+
+    # Prepare duration
+    ref_audio_len = audio.shape[-1] // hop_length
+    # we should prepare the alignment for the " " between ref text and gen text
+    space_duration = 5
+    # also, be careful with the duration and the end of the ref audio => just skip it
+
+    with torch.inference_mode():
+        ref_tokens = convert_char_to_pinyin([ref_text.strip()])[0]
+        ref_mel_ali, unexpanded_gaps = match_alignment(
+            ref_tokens,
+            ref_ali,
+            duration=audio.size(1) / target_sample_rate,
+            sample_rate=target_sample_rate,
+            hop_length=hop_length,
+            expand_gap=True,
+        )
+        print("unexpanded_gaps =", unexpanded_gaps)
+        ref_attn = prepare_attn(ref_mel_ali, ref_mel.size(1)).cuda()
+        ref_tokens = list_str_to_idx([ref_tokens], model.vocab_char_map).cuda()  # [1, text_len]
+
+        gen_tokens = convert_char_to_pinyin([gen_text.strip()])[0]
+        gen_tokens = list_str_to_idx([gen_tokens], model.vocab_char_map).cuda()  # [1, text_len]
+        gen_tokens_mask = torch.ones_like(gen_tokens).bool().cuda()
+
+        gen_duration = duration_predictor(gen_tokens, gen_tokens_mask).squeeze(1).squeeze(0)  # [1, 1, text_len] -> [text_len]
+        gen_duration = torch.exp(gen_duration) * speed
+
+        gen_attn = prepare_attn_from_durations(gen_duration)
+        space_attn = torch.ones(space_duration, dtype=gen_attn.dtype, device=gen_attn.device).unsqueeze(0)
+
+        full_attn = concat_attn([ref_attn, space_attn, gen_attn]).unsqueeze(0)  # [1, full_text_len, full_mel_len]
+
+        space_token = list_str_to_idx([[" "]], model.vocab_char_map).cuda()  # [1, text_len]
+        text = torch.concat([ref_tokens, space_token, gen_tokens], dim=1)  # [1, text_len]
+
+        assert full_attn.size(1) == text.size(1), f"{full_attn.size(1)} != {text.size(1)}"
+
+        full_mel, _ = model.sample(
+            cond=ref_mel,
+            text=text,
+            duration=torch.LongTensor([full_attn.size(2)]).cuda(),
+            steps=nfe_step,
+            cfg_strength=cfg_strength,
+            sway_sampling_coef=sway_sampling_coef,
+            mel_attn=full_attn,
+        )
+        del _
+
+        full_mel = full_mel.to(torch.float32)  # type: ignore
+        ref_audio_len = 0
+        gen_mel = full_mel[:, ref_audio_len:, :].permute(0, 2, 1)
+        if mel_spec_type == "vocos":
+            gen_audio = vocoder.decode(gen_mel)
+        elif mel_spec_type == "bigvgan":
+            gen_audio = vocoder(gen_mel)
+        if rms < target_rms:
+            gen_audio = gen_audio * rms / target_rms
+
+        gen_audio = gen_audio.squeeze().cpu().numpy()
+
+    return gen_audio, target_sample_rate, None

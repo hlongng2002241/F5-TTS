@@ -964,7 +964,7 @@ def load_duration_predictor(text_num_embeds: int, dp_config: dict, path: str, de
     dp = DurationPredictor(text_num_embeds=text_num_embeds, **dp_config).to(device)
     checkpoint = torch.load(path, map_location="cpu")
     dp.load_state_dict(checkpoint["model_state_dict"])
-    return dp
+    return dp.eval()
 
 
 def infer_with_dp(
@@ -983,6 +983,9 @@ def infer_with_dp(
     speed=1,
     device=None,
 ):
+    model.transformer.mel_attn_alpha = 1.0
+    assert model.transformer.mel_attn_alpha == 1.0, model.transformer.mel_attn_alpha
+
     audio, sr = torchaudio.load(ref_audio)
     if audio.shape[0] > 1:
         audio = torch.mean(audio, dim=0, keepdim=True)
@@ -1025,20 +1028,86 @@ def infer_with_dp(
         ref_attn = prepare_attn(ref_mel_ali, ref_mel.size(1)).cuda()
         ref_tokens = list_str_to_idx([ref_tokens], model.vocab_char_map).cuda()  # [1, text_len]
 
-        gen_tokens = convert_char_to_pinyin([gen_text.strip()])[0]
-        gen_tokens = list_str_to_idx([gen_tokens], model.vocab_char_map).cuda()  # [1, text_len]
+        gen_tokens_str = convert_char_to_pinyin([gen_text.strip()])[0]
+        print(f"gen_text (first 50 chars) = {gen_text[:50]}")
+        print(f"gen_tokens_str (first 50) = {gen_tokens_str[:50]}")
+
+        gen_tokens = list_str_to_idx([gen_tokens_str], model.vocab_char_map).cuda()  # [1, text_len]
         gen_tokens_mask = torch.ones_like(gen_tokens).bool().cuda()
 
         gen_duration = duration_predictor(gen_tokens, gen_tokens_mask).squeeze(1).squeeze(0)  # [1, 1, text_len] -> [text_len]
         gen_duration = torch.exp(gen_duration) * speed
 
+        print(f"gen_tokens.shape = {gen_tokens.shape}")
+        print(f"gen_duration (first 20) = {gen_duration[:20].cpu().tolist()}")
+        print(f"gen_duration mean = {gen_duration.mean().item():.2f}, sum = {gen_duration.sum().item():.0f}")
+
         gen_attn = prepare_attn_from_durations(gen_duration)
         space_attn = torch.ones(space_duration, dtype=gen_attn.dtype, device=gen_attn.device).unsqueeze(0)
 
-        full_attn = concat_attn([ref_attn, space_attn, gen_attn]).unsqueeze(0)  # [1, full_text_len, full_mel_len]
+        print(f"ref_attn.shape = {ref_attn.shape}")
+        print(f"space_attn.shape = {space_attn.shape}")
+        print(f"gen_attn.shape = {gen_attn.shape}")
+
+        # try to infer the ref text
+        full_attn = concat_attn([ref_attn, space_attn, ref_attn]).unsqueeze(0)  # [1, full_text_len, full_mel_len]
+
+        print(f"full_attn.shape = {full_attn.shape}")
+        print(f"full_attn.sum() = {full_attn.sum().item():.0f} (should equal full_mel_len)")
+
+        # Check for gap frames (mel frames with no text aligned)
+        mel_coverage = full_attn.sum(dim=1)  # [1, mel_len] - sum over text dimension
+        gap_frames = (mel_coverage == 0).sum().item()
+        print(f"Gap frames (no text aligned): {gap_frames}")
+        if gap_frames > 0:
+            gap_indices = torch.where(mel_coverage[0] == 0)[0]
+            print(f"Gap frame indices: {gap_indices[:20].cpu().tolist()}")  # First 20 gaps
+
+            # Fill gaps by copying alignment from nearest non-gap frame
+            print("Filling alignment gaps...")
+            full_attn_filled = full_attn.clone()
+            gap_mask = (mel_coverage[0] == 0)  # [mel_len]
+
+            # Forward fill: for each gap, copy from previous non-gap
+            last_valid = None
+            for i in range(full_attn.size(2)):  # Iterate over mel frames
+                if not gap_mask[i]:
+                    last_valid = i
+                elif last_valid is not None:
+                    full_attn_filled[0, :, i] = full_attn[0, :, last_valid]
+
+            # Fill remaining leading gaps with first valid frame
+            valid_indices = (~gap_mask).nonzero(as_tuple=True)[0]
+            if len(valid_indices) > 0:
+                first_valid = valid_indices[0].item()
+                if first_valid > 0:
+                    for i in range(first_valid):
+                        full_attn_filled[0, :, i] = full_attn[0, :, first_valid]
+
+            full_attn = full_attn_filled
+
+            # Verify gaps are filled
+            mel_coverage_after = full_attn.sum(dim=1)
+            remaining_gaps = (mel_coverage_after == 0).sum().item()
+            print(f"Remaining gaps after filling: {remaining_gaps}")
+
+        # Sanity check: verify each mel frame has exactly one character aligned
+        print(f"full_attn min coverage per mel frame: {full_attn.sum(dim=1).min().item():.2f}")
+        print(f"full_attn max coverage per mel frame: {full_attn.sum(dim=1).max().item():.2f}")
+        print(f"full_attn mean coverage per mel frame: {full_attn.sum(dim=1).mean().item():.2f}")
+
+        # Check a specific text character - which mel frames does it attend to?
+        print(f"Text char 0 attends to mel frames: {(full_attn[0, 0, :] > 0).sum().item()} frames")
+        print(f"Text char 0 alignment pattern: {full_attn[0, 0, :10].cpu().tolist()}")
 
         space_token = list_str_to_idx([[" "]], model.vocab_char_map).cuda()  # [1, text_len]
-        text = torch.concat([ref_tokens, space_token, gen_tokens], dim=1)  # [1, text_len]
+        # try to infer the ref text
+        text = torch.concat([ref_tokens, space_token, ref_tokens], dim=1)  # [1, text_len]
+
+        print(f"ref_tokens.shape = {ref_tokens.shape}")
+        print(f"space_token.shape = {space_token.shape}")
+        print(f"gen_tokens.shape = {gen_tokens.shape}")
+        print(f"text.shape = {text.shape}")
 
         assert full_attn.size(1) == text.size(1), f"{full_attn.size(1)} != {text.size(1)}"
 
@@ -1054,7 +1123,127 @@ def infer_with_dp(
         del _
 
         full_mel = full_mel.to(torch.float32)  # type: ignore
-        ref_audio_len = 0
+        gen_mel = full_mel[:, ref_audio_len:, :].permute(0, 2, 1)
+        if mel_spec_type == "vocos":
+            gen_audio = vocoder.decode(gen_mel)
+        elif mel_spec_type == "bigvgan":
+            gen_audio = vocoder(gen_mel)
+        if rms < target_rms:
+            gen_audio = gen_audio * rms / target_rms
+
+        gen_audio = gen_audio.squeeze().cpu().numpy()
+
+    return gen_audio, target_sample_rate, None
+
+
+def infer_with_dp_backup(
+    ref_audio: str,
+    ref_text: str,
+    ref_ali: list[tuple[str, float, float]],
+    gen_text: str,
+    model: CFM,
+    vocoder: Vocos,
+    duration_predictor: DurationPredictor,
+    mel_spec_type="vocos",
+    target_rms=0.1,
+    nfe_step=32,
+    cfg_strength=2.0,
+    sway_sampling_coef=-1,
+    speed=1,
+    device=None,
+):
+    model.transformer.mel_attn_alpha = 1.0
+    assert model.transformer.mel_attn_alpha == 1.0, model.transformer.mel_attn_alpha
+
+    audio, sr = torchaudio.load(ref_audio)
+    if audio.shape[0] > 1:
+        audio = torch.mean(audio, dim=0, keepdim=True)
+
+    rms = torch.sqrt(torch.mean(torch.square(audio)))
+    if rms < target_rms:
+        audio = audio * target_rms / rms
+    if sr != target_sample_rate:
+        resampler = torchaudio.transforms.Resample(sr, target_sample_rate)
+        audio = resampler(audio)
+    audio = audio.to(device)
+
+    with torch.inference_mode():
+        ref_mel = model.mel_spec(audio.unsqueeze(0).cuda()).permute(0, 2, 1)  # [1, mel_len, n_mel]
+
+    # if len(ref_text[-1].encode("utf-8")) == 1:
+    #     ref_text = ref_text + " "
+
+    # local_speed = speed
+    # if len(gen_text.encode("utf-8")) < 10:
+    #     local_speed = 0.3
+
+    # Prepare duration
+    ref_audio_len = audio.shape[-1] // hop_length
+    # we should prepare the alignment for the " " between ref text and gen text
+    space_duration = 5
+    # also, be careful with the duration and the end of the ref audio => just skip it
+
+    with torch.inference_mode():
+        ref_tokens = convert_char_to_pinyin([ref_text.strip()])[0]
+        ref_mel_ali, unexpanded_gaps = match_alignment(
+            ref_tokens,
+            ref_ali,
+            duration=audio.size(1) / target_sample_rate,
+            sample_rate=target_sample_rate,
+            hop_length=hop_length,
+            expand_gap=True,
+        )
+        print("unexpanded_gaps =", unexpanded_gaps)
+        ref_attn = prepare_attn(ref_mel_ali, ref_mel.size(1)).cuda()
+        ref_tokens = list_str_to_idx([ref_tokens], model.vocab_char_map).cuda()  # [1, text_len]
+
+        gen_tokens_str = convert_char_to_pinyin([gen_text.strip()])[0]
+        print(f"gen_text (first 50 chars) = {gen_text[:50]}")
+        print(f"gen_tokens_str (first 50) = {gen_tokens_str[:50]}")
+
+        gen_tokens = list_str_to_idx([gen_tokens_str], model.vocab_char_map).cuda()  # [1, text_len]
+        gen_tokens_mask = torch.ones_like(gen_tokens).bool().cuda()
+
+        gen_duration = duration_predictor(gen_tokens, gen_tokens_mask).squeeze(1).squeeze(0)  # [1, 1, text_len] -> [text_len]
+        gen_duration = torch.exp(gen_duration) * speed
+
+        print(f"gen_tokens.shape = {gen_tokens.shape}")
+        print(f"gen_duration (first 20) = {gen_duration[:20].cpu().tolist()}")
+        print(f"gen_duration mean = {gen_duration.mean().item():.2f}, sum = {gen_duration.sum().item():.0f}")
+
+        gen_attn = prepare_attn_from_durations(gen_duration)
+        space_attn = torch.ones(space_duration, dtype=gen_attn.dtype, device=gen_attn.device).unsqueeze(0)
+
+        print(f"ref_attn.shape = {ref_attn.shape}")
+        print(f"space_attn.shape = {space_attn.shape}")
+        print(f"gen_attn.shape = {gen_attn.shape}")
+
+        full_attn = concat_attn([ref_attn, space_attn, gen_attn]).unsqueeze(0)  # [1, full_text_len, full_mel_len]
+
+        print(f"full_attn.shape = {full_attn.shape}")
+
+        space_token = list_str_to_idx([[" "]], model.vocab_char_map).cuda()  # [1, text_len]
+        text = torch.concat([ref_tokens, space_token, gen_tokens], dim=1)  # [1, text_len]
+
+        print(f"ref_tokens.shape = {ref_tokens.shape}")
+        print(f"space_token.shape = {space_token.shape}")
+        print(f"gen_tokens.shape = {gen_tokens.shape}")
+        print(f"text.shape = {text.shape}")
+
+        assert full_attn.size(1) == text.size(1), f"{full_attn.size(1)} != {text.size(1)}"
+
+        full_mel, _ = model.sample(
+            cond=ref_mel,
+            text=text,
+            duration=torch.LongTensor([full_attn.size(2)]).cuda(),
+            steps=nfe_step,
+            cfg_strength=cfg_strength,
+            sway_sampling_coef=sway_sampling_coef,
+            mel_attn=full_attn,
+        )
+        del _
+
+        full_mel = full_mel.to(torch.float32)  # type: ignore
         gen_mel = full_mel[:, ref_audio_len:, :].permute(0, 2, 1)
         if mel_spec_type == "vocos":
             gen_audio = vocoder.decode(gen_mel)

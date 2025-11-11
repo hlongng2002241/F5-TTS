@@ -18,8 +18,8 @@ from torch.utils.data import DataLoader, Dataset, SequentialSampler
 from tqdm import tqdm
 
 from f5_tts.model import CFM
-from f5_tts.model.dataset import DynamicBatchSampler, collate_fn
-from f5_tts.model.utils import default, exists, convert_char_to_pinyin
+from f5_tts.model.dataset import DynamicBatchSampler, collate_fn, prepare_attn, concat_attn
+from f5_tts.model.utils import default, exists, convert_char_to_pinyin, match_alignment
 from f5_tts.infer.utils_infer import load_vocoder
 
 
@@ -485,6 +485,12 @@ class Trainer:
 
         if eval_first:
             self.evaluate(test_dataloader, global_update)
+            if self.log_samples_per_updates > 0:
+                if self.accelerator.is_local_main_process:
+                    self.synthesize_with_attn(vocoder, synthesize_path, global_update)
+                else:
+                    print("Wait for main process to synthesize")
+                self.accelerator.wait_for_everyone()
 
         # Train
         for epoch in tqdm(list(range(skipped_epoch, self.epochs)), desc="Training"):
@@ -578,7 +584,7 @@ class Trainer:
 
                 if self.log_samples_per_updates > 0 and global_update % self.log_samples_per_updates == 0:
                     if self.accelerator.is_local_main_process:
-                        self.synthesize(vocoder, synthesize_path, global_update)
+                        self.synthesize_with_attn(vocoder, synthesize_path, global_update)
                     else:
                         print("Wait for main process to synthesize")
                     self.accelerator.wait_for_everyone()
@@ -593,7 +599,7 @@ class Trainer:
 
             if self.log_samples_per_updates > 0:
                 if self.accelerator.is_local_main_process:
-                    self.synthesize(vocoder, synthesize_path, global_update)
+                    self.synthesize_with_attn(vocoder, synthesize_path, global_update)
                 else:
                     print("Wait for main process to synthesize")
                 self.accelerator.wait_for_everyone()
@@ -635,7 +641,7 @@ class Trainer:
             duration = ref_audio_len + int(ref_audio_len / len(prompt_text) * len(gen_text))
 
             with torch.inference_mode():
-                generated, _ = self.accelerator.unwrap_model(self.model).sample(
+                generated, _ = self.accelerator.unwrap_model(self.model).sample(  # type: ignore
                     cond=prompt_mel,  # Already on correct device from earlier
                     text=infer_text,
                     duration=duration,
@@ -645,6 +651,68 @@ class Trainer:
                 )
                 generated = generated.to(torch.float32)
                 gen_mel_spec = generated[:, ref_audio_len:, :].permute(0, 2, 1).detach().cpu()
+                if self.vocoder_name == "vocos":
+                    gen_audio = vocoder.decode(gen_mel_spec)
+                elif self.vocoder_name == "bigvgan":
+                    gen_audio = vocoder(gen_mel_spec).squeeze(0)
+                else:
+                    raise NotImplementedError(self.vocoder_name)
+
+            torchaudio.save(f"{self.log_samples_path}/update_{global_update}_gen_{index}.wav", gen_audio, target_sample_rate)
+
+        self.model.train()
+
+    def synthesize_with_attn(self, vocoder, synthesize_path: str, global_update: int):
+        from f5_tts.infer.utils_infer import cfg_strength, sway_sampling_coef
+
+        print(f"Synthesize audio from {synthesize_path}")
+        with open(synthesize_path) as f:
+            samples = json.load(f)
+
+        self.model.eval()
+
+        for index, sample in enumerate(samples):
+            text = sample["text"]
+            audio_path = sample["audio_path"]
+            ali_path = sample["ali_path"]
+
+            with open(ali_path) as f:
+                ali = json.load(f)["alignments"]
+
+            text = convert_char_to_pinyin([text.lower()])[0]
+
+            target_sample_rate = self.accelerator.unwrap_model(self.model).mel_spec.target_sample_rate
+            hop_length = self.accelerator.unwrap_model(self.model).mel_spec.hop_length
+            audio, sr = torchaudio.load(audio_path)
+            if target_sample_rate != sr:
+                resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=target_sample_rate)
+                audio = resampler(audio)
+            audio = audio.to(self.accelerator.device)
+
+            mel = self.accelerator.unwrap_model(self.model).mel_spec(audio)
+            mel = mel.permute(0, 2, 1)
+            mel_len = mel.shape[1]
+
+            mel_ali, gaps = match_alignment(text, ali, audio.shape[1] / target_sample_rate, target_sample_rate, hop_length)
+            print("gaps =", gaps)
+            attn = prepare_attn(mel_ali, mel_len).to(self.accelerator.device)
+            attn = concat_attn([attn, attn]).unsqueeze(0)
+
+            text = [text + text]
+            duration = mel_len * 2
+
+            with torch.inference_mode():
+                generated, _ = self.accelerator.unwrap_model(self.model).sample(
+                    cond=mel,  # Already on correct device from earlier
+                    text=text,
+                    duration=duration,
+                    steps=32,
+                    cfg_strength=cfg_strength,
+                    sway_sampling_coef=sway_sampling_coef,
+                    mel_attn=attn,
+                )
+                generated = generated.to(torch.float32)
+                gen_mel_spec = generated[:, mel_len:, :].permute(0, 2, 1).detach().cpu()
                 if self.vocoder_name == "vocos":
                     gen_audio = vocoder.decode(gen_mel_spec)
                 elif self.vocoder_name == "bigvgan":

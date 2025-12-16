@@ -287,7 +287,7 @@ def get_epss_timesteps(n, device, dtype):
 # alignment
 
 
-def match_alignment(tokens: list[str], alignments: list, duration: float, sample_rate: int, hop_length: int, expand_gap=True):
+def match_alignment(tokens: list[str], alignments: list, duration: float, sample_rate: int, hop_length: int, expand_gap=True, return_full_ali=False):
     aligned_tokens = [a[0] for a in alignments if a[0] != "sp"]
     for a in aligned_tokens:
         assert a.strip() != "", 1
@@ -334,6 +334,9 @@ def match_alignment(tokens: list[str], alignments: list, duration: float, sample
         prev = full_alignments[index - 1]
         cur = full_alignments[index]
         assert prev[2] <= cur[1], 8
+        
+    if return_full_ali:
+        return full_alignments, unexpanded_gaps
 
     mel_len = int(duration * sample_rate / hop_length)
     mel_alignments = []

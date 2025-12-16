@@ -57,6 +57,7 @@ class Trainer:
         is_local_vocoder: bool = False,  # use local path vocoder
         local_vocoder_path: str = "",  # local vocoder path
         model_cfg_dict: dict = dict(),  # training config
+        mel_attn_alpha_scheduler=None,
     ):
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
@@ -135,6 +136,8 @@ class Trainer:
         self.noise_scheduler = noise_scheduler
 
         self.duration_predictor = duration_predictor
+
+        self.mel_attn_alpha_scheduler = mel_attn_alpha_scheduler
 
         if bnb_optimizer:
             import bitsandbytes as bnb
@@ -295,7 +298,6 @@ class Trainer:
             checkpoint = load_file(latest_checkpoint, device="cpu")
             checkpoint = {"ema_model_state_dict": checkpoint}
         elif latest_checkpoint.endswith(".pt"):
-            # checkpoint = torch.load(f"{self.checkpoint_path}/{latest_checkpoint}", map_location=self.accelerator.device)  # rather use accelerator.load_state ಥ_ಥ
             checkpoint = torch.load(latest_checkpoint, weights_only=True, map_location="cpu")
         else:
             raise NotImplementedError(latest_checkpoint)
@@ -305,10 +307,16 @@ class Trainer:
             if key in checkpoint["ema_model_state_dict"]:
                 del checkpoint["ema_model_state_dict"][key]
 
+        # load transformer.mel_attn_alpha
+        if "model_state_dict" in checkpoint and "transformer.mel_attn_alpha" not in checkpoint["model_state_dict"]:
+            checkpoint["model_state_dict"]["transformer.mel_attn_alpha"] = torch.tensor(0, dtype=torch.float32)
+        if (
+            "ema_model_state_dict" in checkpoint
+            and "ema_model.transformer.mel_attn_alpha" not in checkpoint["ema_model_state_dict"]
+        ):
+            checkpoint["ema_model_state_dict"]["ema_model.transformer.mel_attn_alpha"] = torch.tensor(0, dtype=torch.float32)
+
         if self.is_main:
-            # Use strict=False for pretrained models that don't have EMA tracking params (initted, step)
-            # strict = "initted" in checkpoint["ema_model_state_dict"] and "step" in checkpoint["ema_model_state_dict"]
-            # self.ema_model.load_state_dict(checkpoint["ema_model_state_dict"], strict=strict)
             self.ema_model.load_state_dict(checkpoint["ema_model_state_dict"])
 
         if "update" in checkpoint or "step" in checkpoint:
@@ -549,22 +557,31 @@ class Trainer:
                         self.ema_model.update()
 
                     global_update += 1
+
+                    # Update mel_attn_alpha if scheduler is provided
+                    if self.mel_attn_alpha_scheduler is not None:
+                        new_alpha = self.mel_attn_alpha_scheduler.get_alpha(global_update)
+                        self.accelerator.unwrap_model(self.model).transformer.set_mel_attn_alpha(new_alpha)
+
                     progress_bar.update(1)
-                    progress_bar.set_postfix(
-                        OrderedDict(
-                            update=str(global_update),
-                            batch_size=len(text_inputs),
-                            lr=self.scheduler.get_last_lr()[0],
-                            loss=loss.item(),
-                            dur_loss=dur_loss.item(),
-                            has_attn=mel_attn is not None,
-                        )
+                    postfix_dict = OrderedDict(
+                        update=str(global_update),
+                        batch_size=len(text_inputs),
+                        lr=self.scheduler.get_last_lr()[0],
+                        loss=loss.item(),
+                        dur_loss=dur_loss.item(),
+                        has_attn=mel_attn is not None,
                     )
+                    if self.mel_attn_alpha_scheduler is not None:
+                        postfix_dict["mel_alpha"] = self.accelerator.unwrap_model(self.model).transformer.mel_attn_alpha.item()
+                    progress_bar.set_postfix(postfix_dict)
 
                 if self.accelerator.is_local_main_process and global_update % self.logging_step == 0:
                     log_dict = {"loss": loss.item(), "dur_loss": dur_loss.item(), "lr": self.scheduler.get_last_lr()[0]}
                     if grad_norm is not None:
                         log_dict["grad_norm"] = grad_norm.item()
+                    if self.mel_attn_alpha_scheduler is not None:
+                        log_dict["mel_attn_alpha"] = self.accelerator.unwrap_model(self.model).transformer.mel_attn_alpha.item()
 
                     self.accelerator.log(log_dict, step=global_update)
 

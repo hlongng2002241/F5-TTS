@@ -206,7 +206,7 @@ class DiT(nn.Module):
         attn_mask_enabled=False,
         long_skip_connection=False,
         checkpoint_activations=False,
-        mel_attn_alpha=0.5,  # Add dual path alpha parameter
+        mel_attn_alpha=None,
     ):
         super().__init__()
 
@@ -227,7 +227,10 @@ class DiT(nn.Module):
 
         self.dim = dim
         self.depth = depth
-        self.mel_attn_alpha = mel_attn_alpha  # Store dual path alpha
+        if mel_attn_alpha is not None:
+            self.register_buffer('mel_attn_alpha', torch.tensor(mel_attn_alpha, dtype=torch.float32))
+        else:
+            self.mel_attn_alpha = 0.0
 
         self.transformer_blocks = nn.ModuleList(
             [
@@ -329,6 +332,9 @@ class DiT(nn.Module):
 
     def clear_cache(self):
         self.text_cond, self.text_uncond = None, None
+
+    def set_mel_attn_alpha(self, alpha: float):
+        self.mel_attn_alpha.fill_(alpha)
 
     def forward(
         self,

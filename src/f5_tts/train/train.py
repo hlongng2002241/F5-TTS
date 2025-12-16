@@ -10,6 +10,7 @@ from f5_tts.model import CFM
 from f5_tts.model.trainer import Trainer
 from f5_tts.model.dataset import load_dataset_v2
 from f5_tts.model.utils import get_tokenizer
+from f5_tts.model.scheduler import MelAttnAlphaScheduler
 
 
 os.chdir(str(files("f5_tts").joinpath("../..")))  # change working directory to root of project (local editable)
@@ -57,6 +58,15 @@ def main(model_cfg):
         use_alignment_aware_masking=model_cfg.model.use_alignment_aware_masking,
     )
 
+    # Create mel_attn_alpha scheduler
+    mel_attn_alpha_scheduler = None
+    if hasattr(model_cfg.model, "mel_attn_alpha_scheduler") and model_cfg.model.mel_attn_alpha_scheduler.enabled:
+        mel_attn_alpha_scheduler = MelAttnAlphaScheduler(
+            start_value=model_cfg.model.mel_attn_alpha_scheduler["start_value"],
+            end_value=model_cfg.model.mel_attn_alpha_scheduler["end_value"],
+            num_steps=model_cfg.model.mel_attn_alpha_scheduler["num_steps"],
+        )
+
     # Initialize trainer
     trainer = Trainer(
         model=model,
@@ -83,6 +93,7 @@ def main(model_cfg):
         is_local_vocoder=model_cfg.model.vocoder.is_local,
         local_vocoder_path=model_cfg.model.vocoder.local_path,
         model_cfg_dict=OmegaConf.to_container(model_cfg, resolve=True),
+        mel_attn_alpha_scheduler=mel_attn_alpha_scheduler,
     )
 
     # train_dataset = load_dataset(model_cfg.datasets.name, tokenizer, mel_spec_kwargs=model_cfg.model.mel_spec)
